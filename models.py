@@ -98,9 +98,9 @@ class NoisePredictionTransformer(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            x_t: [B, L] - Noisy expression at time t (int tensor)
-            t: [B] - Timestep (int tensor)
-            d: [B, n_embd] - T-Net embedding of the dataset (float tensor)
+            x_t: [B, L] - Noisy expression at time t
+            t: [B] - Timestep
+            d: [B, n_embd] - T-Net embedding of the dataset
         Returns:
             noise_pred: [B, L, n_embd] - Predicted continuous noise in embedding space
         """
