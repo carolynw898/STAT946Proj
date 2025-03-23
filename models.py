@@ -58,10 +58,6 @@ class tNet(nn.Module):
         return x
 
 
-import torch
-import torch.nn as nn
-
-
 class NoisePredictionTransformer(nn.Module):
     """Predicts continuous noise in the embedding space for diffusion-based symbolic regression."""
 
