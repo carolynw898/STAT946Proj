@@ -11,6 +11,5 @@ pytz==2025.1
 scipy==1.13.1
 six==1.17.0
 sympy==1.13.1
-torch==2.6.0
 typing_extensions==4.12.2
 tzdata==2025.1
