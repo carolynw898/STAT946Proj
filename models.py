@@ -1,6 +1,3 @@
-import math
-
-import random
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -53,3 +50,19 @@ class tNet(nn.Module):
         #x = self.fc2(x)
 
         return x
+    
+# class PointNet doesn't get used.
+class PointNetConfig:
+    """ base PointNet config """
+    def __init__(self, embeddingSize, numberofPoints, numberofVars, 
+                    numberofYs, method='GPT', varibleEmbedding='NOT_VAR', 
+                    **kwargs):
+        self.embeddingSize = embeddingSize
+        self.numberofPoints = numberofPoints # number of points
+        self.numberofVars = numberofVars # input dimension (Xs)
+        self.numberofYs = numberofYs # output dimension (Ys)
+        self.method = method
+        self.varibleEmbedding = varibleEmbedding
+
+        for k,v in kwargs.items():
+            setattr(self, k, v)
