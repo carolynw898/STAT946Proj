@@ -17,6 +17,7 @@
           pkgsWithUnfree = pkgs // {
             config.allowUnfree = true;
           };
+
 			in {
         _module.args.pkgs = import nixpkgs {
           inherit system;
@@ -30,26 +31,6 @@
 									 	scipy
 									 	matplotlib
 									 	tqdm
-                    buildPythonPackage rec {
-                      pname = "wrapt_timeout_decorator";
-                      version = "1.5.1";
-                      
-                      src = fetchPypi {
-                        inherit pname version;
-                        hash = "sha256-CP3V73yWSArRHBLUct4hrNMjWZlvaaUlkpm1QP66RWA=";
-                      };
-                      
-                      # do not run tests
-                      doCheck = false;
-                      
-                      # specific to buildPythonPackage, see its reference
-                      pyproject = true;
-                      build-system = [
-                        setuptools
-                        wheel
-                      ];
-                    }
-
 									 ]))
           ];
         };
