@@ -185,11 +185,15 @@ class CharDataset(Dataset):
         # maxY = max(chunk['Y'])
         # minX = min(chunk['X'])
         # minY = min(chunk['Y'])
-        points = torch.zeros(self.numVars+self.numYs, self.numPoints[1]-1)
+        points = torch.zeros(self.numVars+self.numYs, self.numPoints-1)
         for idx, xy in enumerate(zip(chunk['X'], chunk['Y'])):
 
+            if not isinstance(xy[0], list) or not isinstance(xy[1], (list, float, np.float64)):
+                print(f"Unexpected types: {type(xy[0])}, {type(xy[1])}")
+                continue  # Skip if types are incorrect
+
             # don't let to exceed the maximum number of points
-            if idx >= self.numPoints[1]-1:
+            if idx >= self.numPoints-1:
                 break
             
             x = xy[0]
