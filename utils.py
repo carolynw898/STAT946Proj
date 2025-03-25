@@ -8,6 +8,7 @@ import re
 import numpy as np
 import tqdm
 import random
+from math import exp, sin, cos
 
 def generateDataStrEq(eq, n_points=2, n_vars=3,
                       decimals=4, supportPoints=None, 
@@ -236,3 +237,48 @@ class CharDataset(Dataset):
         outputs = torch.tensor(outputs, dtype=torch.long)
         numVars = torch.tensor(numVars, dtype=torch.long)
         return inputs, outputs, points, numVars
+
+# Relative Mean Square Error
+def relativeErr(y, yHat, info=False, eps=1e-5):
+    yHat = np.reshape(yHat, [1, -1])[0]
+    y = np.reshape(y, [1, -1])[0]
+    if len(y) > 0 and len(y)==len(yHat):
+        err = ( (yHat - y) )** 2 / np.linalg.norm(y+eps)
+        if info:
+            for _ in range(5):
+                i = np.random.randint(len(y))
+                print('yPR,yTrue:{},{}, Err:{}'.format(yHat[i],y[i],err[i]))
+    else:
+        err = 100
+
+    return np.mean(err)
+
+def lossFunc(constants, eq, X, Y, eps=1e-5):
+    err = 0
+    eq = eq.replace('C','{}').format(*constants)
+
+    for x,y in zip(X,Y):
+        eqTemp = eq + ''
+        if type(x) == np.float32:
+            x = [x]
+        for i,e in enumerate(x):
+            # make sure e is not a tensor
+            if type(e) == torch.Tensor:
+                e = e.item()
+            eqTemp = eqTemp.replace('x{}'.format(i+1), str(e))
+        try:
+            yHat = eval(eqTemp)
+        except:
+            print('Exception has been occured! EQ: {}, OR: {}'.format(eqTemp, eq))
+            continue
+            yHat = 100
+        try:
+            # handle overflow
+            err += relativeErr(y, yHat) #(y-yHat)**2
+        except:
+            print('Exception has been occured! EQ: {}, OR: {}, y:{}-yHat:{}'.format(eqTemp, eq, y, yHat))
+            continue
+            err += 10
+        
+    err /= len(Y)
+    return err
