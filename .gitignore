@@ -1,2 +1,4 @@
 env/
 venv/
+s946_env/
+__pycache__/
