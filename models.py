@@ -302,7 +302,7 @@ class NoisePredictionTransformer(nn.Module):
 #                    p = None, # Points
 #                    v = None # Variables
 #                    tokenizer = None
-#                    ):
+#     ):
 
 #         c = p
 
