@@ -305,7 +305,7 @@ class SymbolicDiffusion(nn.Module):
         ce_loss = F.cross_entropy(
             pred_logits.view(-1, self.vocab_size), tokens.view(-1)
         ).view(pred_logits.shape[0], -1)
-        weighted_ce_loss = (ce_weight * ce_loss).mean()
+        weighted_ce_loss = (ce_weight * ce_loss).mean(dim=1)
 
         total_loss = mse_loss + weighted_ce_loss
         return total_loss
