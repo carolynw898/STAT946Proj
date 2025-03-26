@@ -110,18 +110,14 @@ class NoisePredictionTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layer)
 
-        self.ln_f = nn.LayerNorm(n_embd)
-
-        self.head = nn.Linear(n_embd, n_embd)
-
     def forward(
-        self, x_t: torch.Tensor, t: torch.Tensor, d: torch.Tensor
+        self, x_t: torch.Tensor, t: torch.Tensor, condition: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
-            x_t: [B, L] - Noisy expression at time t
+            x_t: [B, L] - Noisy expression at time t (token indices)
             t: [B] - Timestep
-            d: [B, n_embd] - T-Net embedding of the dataset
+            condition: [B, n_embd] - Combined T-Net and variable embeddings
         Returns:
             noise_pred: [B, L, n_embd] - Predicted continuous noise in embedding space
         """
@@ -130,14 +126,11 @@ class NoisePredictionTransformer(nn.Module):
         tok_emb = self.tok_emb(x_t)  # [B, L, n_embd]
         pos_emb = self.pos_emb[:, :L, :]  # [1, L, n_embd]
         time_emb = self.time_emb(t).unsqueeze(1)  # [B, 1, n_embd]
-        d = d.unsqueeze(1)  # [B, 1, n_embd]
+        condition = condition.unsqueeze(1)  # [B, 1, n_embd]
 
-        x = tok_emb + pos_emb + time_emb + d  # [B, L, n_embd]
+        x = tok_emb + pos_emb + time_emb + condition  # [B, L, n_embd]
 
-        x = self.encoder(x)
-        x = self.ln_f(x)
-
-        noise_pred = self.head(x)  # [B, L, n_embd]
+        noise_pred = self.encoder(x)  # [B, L, n_embd]
         return noise_pred
 
 
