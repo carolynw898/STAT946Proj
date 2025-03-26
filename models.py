@@ -253,7 +253,8 @@ class SymbolicDiffusion(nn.Module):
         t = torch.randint(0, self.timesteps, (B,), device=device)
         xt, noise = self.q_sample(token_emb, t)
         noise_pred = self.transformer(xt, t, condition)
-        y_pred = self.p_sample(xt, t, noise_pred)
+        latent_y_pred = self.p_sample(xt, t, noise_pred)
+        y_pred = self.decoder(latent_y_pred)
         return y_pred, noise_pred, noise
 
     @torch.no_grad()
