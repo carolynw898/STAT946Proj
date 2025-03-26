@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from typing import Tuple
 
 
 # from SymbolicGPT: https://github.com/mojivalipour/symbolicgpt/blob/master/models.py
@@ -111,205 +112,201 @@ class NoisePredictionTransformer(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layer)
 
     def forward(
-        self, x_t: torch.Tensor, t: torch.Tensor, condition: torch.Tensor
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        condition: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        """Predicts noise from noisy token indices, timestep, and condition.
+
         Args:
             x_t: [B, L] - Noisy expression at time t (token indices)
             t: [B] - Timestep
             condition: [B, n_embd] - Combined T-Net and variable embeddings
+
         Returns:
-            noise_pred: [B, L, n_embd] - Predicted continuous noise in embedding space
+            noise_pred: [B, L, n_embd] - Predicted noise in embedding space
         """
-        B, L = x_t.shape
+        _, L = x_t.shape
 
-        tok_emb = self.tok_emb(x_t)  # [B, L, n_embd]
-        pos_emb = self.pos_emb[:, :L, :]  # [1, L, n_embd]
-        time_emb = self.time_emb(t).unsqueeze(1)  # [B, 1, n_embd]
-        condition = condition.unsqueeze(1)  # [B, 1, n_embd]
+        tok_emb = self.tok_emb(x_t)
+        pos_emb = self.pos_emb[:, :L, :]
+        time_emb = self.time_emb(t).unsqueeze(1)
+        condition = condition.unsqueeze(1)
 
-        x = tok_emb + pos_emb + time_emb + condition  # [B, L, n_embd]
-
-        noise_pred = self.encoder(x)  # [B, L, n_embd]
+        x = tok_emb + pos_emb + time_emb + condition
+        noise_pred = self.encoder(x)
         return noise_pred
 
 
-# ++++++++++++++++++++++++++++++++++++++++
-# DIFFUSION PART
+class SymbolicDiffusion(nn.Module):
+    def __init__(
+        self,
+        pconfig,
+        vocab_size: int,
+        max_seq_len: int,
+        max_num_vars: int = 9,
+        n_layer: int = 6,
+        n_head: int = 8,
+        n_embd: int = 512,
+        timesteps: int = 1000,
+        beta_start: float = 0.0001,
+        beta_end: float = 0.02,
+    ):
+        super().__init__()
+        self.timesteps = timesteps
+        self.n_embd = n_embd
+        self.max_seq_len = max_seq_len
+        self.vocab_size = vocab_size
 
-# Image noise model
+        self.tnet = tNet(pconfig)
+        self.vars_emb = nn.Embedding(max_num_vars, n_embd)
+        self.transformer = NoisePredictionTransformer(
+            vocab_size,
+            max_seq_len,
+            n_layer=n_layer,
+            n_head=n_head,
+            n_embd=n_embd,
+            max_timesteps=timesteps,
+        )
+        self.decoder = nn.Linear(n_embd, vocab_size)
 
-# class ConditionalTimedUnet(nn.Module):
-#     checkpoint_name = "timeattnunet"
+        self.beta = torch.linspace(beta_start, beta_end, timesteps)
+        self.alpha = 1.0 - self.beta
+        self.alpha_bar = torch.cumprod(self.alpha, dim=0)
+        self.register_buffer("beta", self.beta)
+        self.register_buffer("alpha", self.alpha)
+        self.register_buffer("alpha_bar", self.alpha_bar)
 
-#     def __init__(self, enc_chs=(3,32,64,128,256), dec_chs=(256,128,64,32), out_channels=3, time_emb_dim = 4):
-#         super().__init__()
-#         self.pool = nn.MaxPool2d((2,2))
+    def q_sample(
+        self,
+        x0: torch.Tensor,
+        t: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Adds Gaussian noise to the input embeddings at time t.
 
-#         self.encoder = nn.ModuleList([
-#             TimeDoubleConv(enc_chs[i], enc_chs[i+1],time_emb_dim=time_emb_dim)
-#             for i in range(len(enc_chs)-1)])
+        Args:
+            x0: [B, L, n_embd] - Original expression embeddings
+            t: [B] - Timestep
 
-#         self.cond_encoder = nn.ModuleList([
-#             TimeDoubleConv(enc_chs[i], enc_chs[i+1],time_emb_dim=time_emb_dim)
-#             for i in range(len(enc_chs)-1)])
+        Returns:
+            xt: [B, L, n_embd] - Noisy embeddings at time t
+            noise: [B, L, n_embd] - Noise added to the original embeddings
+        """
+        noise = torch.randn_like(x0, dtype=torch.float)
+        sqrt_alpha_bar = torch.sqrt(self.alpha_bar[t]).view(-1, 1, 1)
+        sqrt_subone_alpha_bar = torch.sqrt(1 - self.alpha_bar[t]).view(-1, 1, 1)
+        xt = sqrt_alpha_bar * x0 + sqrt_subone_alpha_bar * noise
+        return xt, noise
 
+    @torch.no_grad()
+    def p_sample(
+        self,
+        x: torch.Tensor,
+        t: int,
+        condition: torch.Tensor,
+        device: str = "cuda",
+    ) -> torch.Tensor:
+        """Denoises the noisy embeddings at time t.
 
-#         self.decoder = nn.ModuleList([
-#             TimeDoubleConv(dec_chs[i], dec_chs[i+1],time_emb_dim=time_emb_dim, up=True)
-#             for i in range(len(dec_chs)-1)])
+        Args:
+            x: [B, L, n_embd] - Noisy embeddings at time t
+            t: int - Current timestep (scalar)
+            condition: [B, n_embd] - Combined T-Net and variable embeddings
+            device: str - Device to use (e.g., "cuda")
 
-#         self.output_layer = nn.Sequential(
-#           AttentionBlock(dec_chs[-1]),
-#           nn.ConvTranspose2d(dec_chs[-1], out_channels, 4, 2, 1)
-#         )
+        Returns:
+            x: [B, L, n_embd] - Denoised embeddings
+        """
+        B = x.shape[0]
+        t_batch = torch.full((B,), t, device=device, dtype=torch.long)
+        beta_t = self.beta[t].view(-1, 1, 1)
+        alpha_t = self.alpha[t].view(-1, 1, 1)
+        alpha_bar_t = self.alpha_bar[t].view(-1, 1, 1)
+        noise_pred = self.transformer(x, t_batch, condition)
+        mean = (1 / torch.sqrt(alpha_t)) * (
+            x - (beta_t / torch.sqrt(1 - alpha_bar_t)) * noise_pred
+        )
+        return mean
 
-#     def forward(self, x, c, t):
-#         ftrs = []
-#         for block in self.encoder:
-#             x = block(x,t)
-#             # x = self.pool(x)
-#             ftrs.append(x)
+    def forward(
+        self,
+        points: torch.Tensor,
+        tokens: torch.Tensor,
+        variables: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Training forward pass to predict noise added to embeddings.
 
-#         cftrs = []
-#         for block in self.encoder:
-#             c = block(c,t)
-#             # x = self.pool(x)
-#             cftrs.append(c)
+        Args:
+            points: [B, 2, 250] - Dataset points for conditioning
+            tokens: [B, L] - Ground truth expression (token indices)
+            variables: [B] - Number of variables per sample
 
-#         for up, skip_con, cond_skip_con in zip(self.decoder, ftrs[::-1], cftrs[::-1]):
-#             skip_con = skip_con.to(x.device)
-#             x = torch.cat([x, skip_con, cond_skip_con], dim=1)
-#             x = up(x,t)
+        Returns:
+            noise_pred: [B, L, n_embd] - Predicted noise
+            noise: [B, L, n_embd] - Actual noise added
+        """
+        device = points.device
+        B = tokens.shape[0]
 
-#         out = self.output_layer(x)
-#         return out
+        condition = self.tnet(points)
+        vars_emb = self.vars_emb(variables)
+        condition = condition + vars_emb
 
+        token_emb = self.transformer.tok_emb(tokens)
+        t = torch.randint(0, self.timesteps, (B,), device=device)
+        xt, noise = self.q_sample(token_emb, t)
+        noise_pred = self.transformer(xt, t, condition)
+        return noise_pred, noise
 
-# class DiffusionConfig:
-#     """ base PointNet config """
-#     def __init__(self, model, timesteps = 1000,
-#                  beta_start=0.0001, beta_end=0.02,
-#                     **kwargs):
-#         self.model = model
-#         self.timesteps = timesteps
-#         self.beta_start = beta_start # number of points
-#         self.beta_end = beta_end # input dimension (Xs)
+    @torch.no_grad()
+    def sample(
+        self,
+        points: torch.Tensor,
+        variables: torch.Tensor,
+        device: str = "cuda",
+    ) -> torch.Tensor:
+        """Generates a sample by denoising from random noise.
 
-#         for k,v in kwargs.items():
-#             setattr(self, k, v)
+        Args:
+            points: [B, 2, 250] - Dataset points for conditioning
+            variables: [B] - Number of variables per sample
+            device: str - Device to use (e.g., "cuda")
 
+        Returns:
+            xt: [B, L] - Generated expression (token indices)
+        """
+        condition = self.tnet(points)
+        vars_emb = self.vars_emb(variables)
+        condition = condition + vars_emb
+        B = condition.shape[0]
 
-# class Diffusion(nn.Module):
-#     def __init__(self, dconfig, pconfig = None):
-#         super().__init__()
-#         self.timesteps = dconfig.timesteps
-#         self.model = dconfig.model
-#         self.checkpoint_name = 'diffusion-' + self.model.checkpoint_name
+        xt = torch.randint(
+            0, self.vocab_size, (B, self.max_seq_len), device=device, dtype=torch.long
+        )
+        for t in range(self.timesteps - 1, -1, -1):
+            xt_emb = self.transformer.tok_emb(xt)
+            xt_emb = self.p_sample(xt_emb, t, condition, device)
+            xt_logits = self.decoder(xt_emb)
+            xt = torch.argmax(xt_logits, dim=-1)
+        return xt
 
-#         beta = torch.linspace(dconfig.beta_start, dconfig.beta_end, timesteps)
-#         alpha = 1.0 - beta
-#         alpha_bar = torch.cumprod(alpha, dim=0)
+    def loss_fn(
+        self,
+        noise_pred: torch.Tensor,  # [B, L, n_embd]
+        noise: torch.Tensor,  # [B, L, n_embd]
+        pred_logits: torch.Tensor,  # [B, L, vocab_size]
+        tokens: torch.Tensor,  # [B, L]
+        t: torch.Tensor,  # [B]
+    ) -> torch.Tensor:
+        """Computes combined MSE (diffusion) and scheduled CE (token) loss."""
+        mse_loss = F.mse_loss(noise_pred, noise)
 
-#         if pconfig is not None:
-#             self.pconfig = pconfig
-#             self.pnet = tNet(pconfig)
+        ce_weight = 1.0 - (t.float() / self.timesteps)
+        ce_loss = F.cross_entropy(
+            pred_logits.view(-1, self.vocab_size), tokens.view(-1)
+        ).view(pred_logits.shape[0], -1)
+        weighted_ce_loss = (ce_weight * ce_loss).mean()
 
-#         self.register_buffer("beta", beta)
-#         self.register_buffer("alpha", alpha)
-#         self.register_buffer("alpha_bar", alpha_bar)
-
-#     def q_sample(self, x0, t):
-#         "Forward process"
-#         noise = torch.randn_like(x0)
-#         sqrt_alpha_bar = torch.sqrt(self.alpha_bar[t])[:, None, None, None]
-#         sqrt_subone_alpha_bar = torch.sqrt(1 - self.alpha_bar[t])[:, None, None, None]
-#         return sqrt_alpha_bar * x0 + sqrt_subone_alpha_bar * noise, noise
-
-
-#     @torch.no_grad()
-#     def p_sample(self, x, t, condition = None, device="cuda"):
-#         "Backward process, t is an integer"
-#         num_samples = condition.size(0)
-#         t_batch = torch.tensor([t] * num_samples, device=device)  # Time conditioning
-#         beta_t = self.beta[t].view(-1, 1, 1, 1)
-#         alpha_t = self.alpha[t].view(-1, 1, 1, 1)
-#         alpha_bar_t = self.alpha_bar[t].view(-1, 1, 1, 1)
-
-#         pred_noise = self.model(x, condition, t_batch)  # Predict noise
-#         mean = (1 / torch.sqrt(alpha_t)) \
-#           * (x - beta_t * pred_noise / torch.sqrt(1 - alpha_bar_t))
-
-#         return mean
-
-
-#     @torch.no_grad()
-#     def sample(self, condition, img_size=(3, 32, 32), device="cuda"):
-#         """Generate images from pure noise"""
-#         assert torch.is_grad_enabled() == False
-
-#         num_samples = condition.size(0)
-
-#         self.model.eval()
-#         x = torch.randn((num_samples, *img_size), device=device)  # Start with Gaussian noise
-
-#         for t in range(self.timesteps - 1, -1, -1):
-
-#             mean = self.p_sample(condition, x, t)
-#             if t > 0:
-#                 noise = torch.randn_like(x, device = device)
-#                 x = mean + torch.sqrt(beta_t) * noise
-#             else:
-#                 x = mean
-
-#         return x
-
-
-#     @torch.no_grad()
-#     def sample_progressive(self, condition, img_size=(3, 32, 32), device="cuda"):
-#         """Generate images from pure noise"""
-#         assert torch.is_grad_enabled() == False
-
-#         num_samples = condition.size(0)
-#         self.model.eval()
-#         x = torch.randn((num_samples, *img_size), device=device)
-#         xts=[]
-
-#         for t in range(self.timesteps - 1, -1, -1):
-#             mean = self.p_sample(x,condition, t)
-#             mean = torch.clamp(mean, -1.0, 1.0)
-#             if t > 0:
-#                 # noise = torch.randn_like(x, device = device)
-#                 # x = mean + torch.sqrt(beta_t) * noise
-#                 x = mean
-#             else:
-#                 x = mean
-
-#             xts.append(x * 0.5 + 0.5)
-
-#         return xts
-
-#     # TODO: Maybe rescale diffusion
-#     def train_step(self,
-#                    x, # Input equation
-#                    p = None, # Points
-#                    v = None # Variables
-#                    tokenizer = None
-#     ):
-
-#         c = p
-
-#         if self.pnet is not None:
-#             c = self.pnet(p)
-
-#         t = torch.randint(0, model.timesteps, (x0.shape[0],), device=device)
-
-#         # Sample for diffusion forward process.
-#         xt, noise = self.q_sample(x0, t)
-#         noise_hat = model(xt, c, t) # train the noise predictor
-#         loss = criterion(noise_hat, noise)  # Assuming reconstruction of images
-
-#         return loss(noise_hat, noise)
-
-#     def forward(self, condition, *args, **kwargs):
-#         return self.sample(condition)
+        total_loss = mse_loss + weighted_ce_loss
+        return total_loss
