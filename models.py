@@ -202,8 +202,7 @@ class SymbolicDiffusion(nn.Module):
         self,
         x: torch.Tensor,
         t: int,
-        condition: torch.Tensor,
-        device: str = "cuda",
+        noise_pred: torch.Tensor,
     ) -> torch.Tensor:
         """Denoises the noisy embeddings at time t.
 
@@ -217,11 +216,9 @@ class SymbolicDiffusion(nn.Module):
             x: [B, L, n_embd] - Denoised embeddings
         """
         B = x.shape[0]
-        t_batch = torch.full((B,), t, device=device, dtype=torch.long)
         beta_t = self.beta[t].view(-1, 1, 1)
         alpha_t = self.alpha[t].view(-1, 1, 1)
         alpha_bar_t = self.alpha_bar[t].view(-1, 1, 1)
-        noise_pred = self.transformer(x, t_batch, condition)
         mean = (1 / torch.sqrt(alpha_t)) * (
             x - (beta_t / torch.sqrt(1 - alpha_bar_t)) * noise_pred
         )
@@ -232,7 +229,7 @@ class SymbolicDiffusion(nn.Module):
         points: torch.Tensor,
         tokens: torch.Tensor,
         variables: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Training forward pass to predict noise added to embeddings.
 
         Args:
@@ -241,6 +238,7 @@ class SymbolicDiffusion(nn.Module):
             variables: [B] - Number of variables per sample
 
         Returns:
+            y_pred: [B, L] - Generated expression (token indices)
             noise_pred: [B, L, n_embd] - Predicted noise
             noise: [B, L, n_embd] - Actual noise added
         """
@@ -255,7 +253,8 @@ class SymbolicDiffusion(nn.Module):
         t = torch.randint(0, self.timesteps, (B,), device=device)
         xt, noise = self.q_sample(token_emb, t)
         noise_pred = self.transformer(xt, t, condition)
-        return noise_pred, noise
+        y_pred = self.p_sample(xt, t, noise_pred)
+        return y_pred, noise_pred, noise
 
     @torch.no_grad()
     def sample(
@@ -284,7 +283,8 @@ class SymbolicDiffusion(nn.Module):
         )
         for t in range(self.timesteps - 1, -1, -1):
             xt_emb = self.transformer.tok_emb(xt)
-            xt_emb = self.p_sample(xt_emb, t, condition, device)
+            noise_pred = self.transformer(xt_emb, t, condition)
+            xt_emb = self.p_sample(xt_emb, t, noise_pred)
             xt_logits = self.decoder(xt_emb)
             xt = torch.argmax(xt_logits, dim=-1)
         return xt
