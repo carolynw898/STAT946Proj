@@ -87,18 +87,14 @@ class NoisePredictionTransformer(nn.Module):
         self,
         vocab_size: int,
         max_seq_len: int,
+        padding_idx: int = 0,
         n_layer: int = 6,
         n_head: int = 8,
         n_embd: int = 512,
         max_timesteps: int = 1000,
     ):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
-        self.n_embd = n_embd
-        self.max_timesteps = max_timesteps
-
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
+        self.tok_emb = nn.Embedding(vocab_size, n_embd, padding_idx=padding_idx)
         self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, n_embd))
         self.time_emb = nn.Embedding(max_timesteps, n_embd)
 
@@ -145,6 +141,7 @@ class SymbolicDiffusion(nn.Module):
         pconfig,
         vocab_size: int,
         max_seq_len: int,
+        padding_idx: int = 0,
         max_num_vars: int = 9,
         n_layer: int = 6,
         n_head: int = 8,
@@ -164,6 +161,7 @@ class SymbolicDiffusion(nn.Module):
         self.transformer = NoisePredictionTransformer(
             vocab_size,
             max_seq_len,
+            padding_idx,
             n_layer=n_layer,
             n_head=n_head,
             n_embd=n_embd,
