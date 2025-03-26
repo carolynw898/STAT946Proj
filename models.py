@@ -94,7 +94,9 @@ class NoisePredictionTransformer(nn.Module):
         max_timesteps: int = 1000,
     ):
         super().__init__()
-        self.tok_emb = nn.Embedding(vocab_size, n_embd, padding_idx=padding_idx)
+        self.tok_emb = nn.Embedding(
+            vocab_size, n_embd, padding_idx=torch.tensor(padding_idx, dtype=torch.long)
+        )
         self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, n_embd))
         self.time_emb = nn.Embedding(max_timesteps, n_embd)
 
@@ -172,9 +174,6 @@ class SymbolicDiffusion(nn.Module):
         self.beta = torch.linspace(beta_start, beta_end, timesteps)
         self.alpha = 1.0 - self.beta
         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-        self.register_buffer("beta", self.beta)
-        self.register_buffer("alpha", self.alpha)
-        self.register_buffer("alpha_bar", self.alpha_bar)
 
     def q_sample(
         self,
