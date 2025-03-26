@@ -123,7 +123,8 @@ class NoisePredictionTransformer(nn.Module):
         Returns:
             noise_pred: [B, L, n_embd] - Predicted noise in embedding space
         """
-        _, L = x_t.shape
+        # print(x_t.shape)
+        _, L, _ = x_t.shape
 
         tok_emb = self.tok_emb(x_t)
         pos_emb = self.pos_emb[:, :L, :]
@@ -172,9 +173,9 @@ class SymbolicDiffusion(nn.Module):
         self.beta = torch.linspace(beta_start, beta_end, timesteps)
         self.alpha = 1.0 - self.beta
         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-        self.register_buffer("beta", self.beta)
-        self.register_buffer("alpha", self.alpha)
-        self.register_buffer("alpha_bar", self.alpha_bar)
+        # self.register_buffer("beta", self.beta)
+        # self.register_buffer("alpha", self.alpha)
+        # self.register_buffer("alpha_bar", self.alpha_bar)
 
     def q_sample(
         self,
