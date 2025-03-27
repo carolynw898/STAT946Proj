@@ -128,12 +128,15 @@ class NoisePredictionTransformer(nn.Module):
         # print(x_t.shape)
         _, L, _ = x_t.shape
 
-        tok_emb = self.tok_emb(x_t)
+        # print(f"x_t min: {x_t.min().item()}, max: {x_t.max().item()}")
+        # print(self.tok_emb.weight.shape[0])  # Number of embeddings
+
+        # tok_emb = self.tok_emb(x_t.long())
         pos_emb = self.pos_emb[:, :L, :]
         time_emb = self.time_emb(t).unsqueeze(1)
         condition = condition.unsqueeze(1)
 
-        x = tok_emb + pos_emb + time_emb + condition
+        x = x_t + pos_emb + time_emb + condition
         noise_pred = self.encoder(x)
         return noise_pred
 
@@ -250,7 +253,8 @@ class SymbolicDiffusion(nn.Module):
         condition = condition + vars_emb
 
         token_emb = self.transformer.tok_emb(tokens)
-        t = torch.randint(0, self.timesteps, (B,), device=device)
+        # t = torch.randint(0, self.timesteps, (B,), device=device)
+        t = torch.randint(1, self.timesteps, (B,), device=device)
         xt, noise = self.q_sample(token_emb, t)
         noise_pred = self.transformer(xt, t, condition)
         latent_y_pred = self.p_sample(xt, t, noise_pred)
@@ -303,9 +307,9 @@ class SymbolicDiffusion(nn.Module):
 
         ce_weight = 1.0 - (t.float() / self.timesteps)
         ce_loss = F.cross_entropy(
-            pred_logits.view(-1, self.vocab_size), tokens.view(-1)
+            pred_logits.view(-1, self.vocab_size), tokens.view(-1), reduction = "none"
         ).view(pred_logits.shape[0], -1)
-        weighted_ce_loss = (ce_weight * ce_loss).mean(dim=1)
+        weighted_ce_loss = (ce_weight * ce_loss).mean()
 
         total_loss = mse_loss + weighted_ce_loss
         return total_loss
