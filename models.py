@@ -175,9 +175,9 @@ class SymbolicDiffusion(nn.Module):
         )
         self.decoder = nn.Linear(n_embd, vocab_size)
 
-        self.beta = torch.linspace(beta_start, beta_end, timesteps)
-        self.alpha = 1.0 - self.beta
-        self.alpha_bar = torch.cumprod(self.alpha, dim=0)
+        self.register_buffer("beta", torch.linspace(beta_start, beta_end, timesteps))
+        self.register_buffer("alpha", 1.0 - self.beta)
+        self.register_buffer("alpha_bar", torch.cumprod(self.alpha, dim=0))
 
     def q_sample(
         self,
@@ -232,6 +232,7 @@ class SymbolicDiffusion(nn.Module):
         points: torch.Tensor,
         tokens: torch.Tensor,
         variables: torch.Tensor,
+        t: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Training forward pass to predict noise added to embeddings.
 
@@ -239,13 +240,13 @@ class SymbolicDiffusion(nn.Module):
             points: [B, 2, 250] - Dataset points for conditioning
             tokens: [B, L] - Ground truth expression (token indices)
             variables: [B] - Number of variables per sample
+            t: [B] - Timestep
 
         Returns:
             y_pred: [B, L] - Generated expression (token indices)
             noise_pred: [B, L, n_embd] - Predicted noise
             noise: [B, L, n_embd] - Actual noise added
         """
-        device = points.device
         B = tokens.shape[0]
 
         condition = self.tnet(points)
@@ -253,8 +254,6 @@ class SymbolicDiffusion(nn.Module):
         condition = condition + vars_emb
 
         token_emb = self.transformer.tok_emb(tokens)
-        # t = torch.randint(0, self.timesteps, (B,), device=device)
-        t = torch.randint(1, self.timesteps, (B,), device=device)
         xt, noise = self.q_sample(token_emb, t)
         noise_pred = self.transformer(xt, t, condition)
         latent_y_pred = self.p_sample(xt, t, noise_pred)
@@ -307,7 +306,7 @@ class SymbolicDiffusion(nn.Module):
 
         ce_weight = 1.0 - (t.float() / self.timesteps)
         ce_loss = F.cross_entropy(
-            pred_logits.view(-1, self.vocab_size), tokens.view(-1), reduction = "none"
+            pred_logits.view(-1, self.vocab_size), tokens.view(-1), reduction="none"
         ).view(pred_logits.shape[0], -1)
         weighted_ce_loss = (ce_weight * ce_loss).mean()
 
