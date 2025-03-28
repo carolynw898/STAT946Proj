@@ -149,8 +149,8 @@ class SymbolicDiffusion(nn.Module):
         max_seq_len: int,
         padding_idx: int = 0,
         max_num_vars: int = 9,
-        n_layer: int = 6,
-        n_head: int = 8,
+        n_layer: int = 4,
+        n_head: int = 4,
         n_embd: int = 512,
         timesteps: int = 1000,
         beta_start: float = 0.0001,
@@ -282,15 +282,13 @@ class SymbolicDiffusion(nn.Module):
         condition = condition + vars_emb
         B = condition.shape[0]
 
-        xt = torch.randint(
-            0, self.vocab_size, (B, self.max_seq_len), device=device, dtype=torch.long
-        )
+        xt_emb = torch.randn_like((B, self.max_seq_len, self.n_embd), device=device)
         for t in range(self.timesteps - 1, -1, -1):
-            xt_emb = self.transformer.tok_emb(xt)
             noise_pred = self.transformer(xt_emb, t, condition)
             xt_emb = self.p_sample(xt_emb, t, noise_pred)
             xt_logits = self.decoder(xt_emb)
             xt = torch.argmax(xt_logits, dim=-1)
+            xt_emb = self.transformer.tok_emb(xt)
         return xt
 
     def loss_fn(
@@ -302,12 +300,15 @@ class SymbolicDiffusion(nn.Module):
         t: torch.Tensor,  # [B]
     ) -> torch.Tensor:
         """Computes combined MSE (diffusion) and scheduled CE (token) loss."""
+        B = pred_logits.shape[0]
         mse_loss = F.mse_loss(noise_pred, noise)
 
+        # one-hot encode the tokens
+        tokens = F.one_hot(tokens, num_classes=self.vocab_size).float()
         ce_weight = 1.0 - (t.float() / self.timesteps)
         ce_loss = F.cross_entropy(
-            pred_logits.view(-1, self.vocab_size), tokens.view(-1), reduction="none"
-        ).view(pred_logits.shape[0], -1)
+            pred_logits.view(B, -1), tokens.view(B, -1), reduction="none"
+        ).view(B, -1)
         weighted_ce_loss = (ce_weight * ce_loss).mean()
 
         total_loss = mse_loss + weighted_ce_loss
