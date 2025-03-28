@@ -277,15 +277,15 @@ class SymbolicDiffusion(nn.Module):
         Returns:
             xt: [B, L] - Generated expression (token indices)
         """
-        condition = self.tnet(points)
-        vars_emb = self.vars_emb(variables)
-        condition = condition + vars_emb
+        condition = self.tnet(points) + self.vars_emb(variables)  # [B, n_embd]
         B = condition.shape[0]
 
-        xt_emb = torch.randn_like((B, self.max_seq_len, self.n_embd), device=device)
+        xt_emb = torch.randn(B, self.max_seq_len, self.n_embd, device=device)
+        t_tensor = torch.zeros(B, dtype=torch.long, device=device)  # [B]
         for t in range(self.timesteps - 1, -1, -1):
-            noise_pred = self.transformer(xt_emb, t, condition)
-            xt_emb = self.p_sample(xt_emb, t, noise_pred)
+            t_tensor.fill_(t)  # Update in-place: [B] all set to t
+            noise_pred = self.transformer(xt_emb, t_tensor, condition)
+            xt_emb = self.p_sample(xt_emb, t, noise_pred)  # t as int for p_sample
             xt_logits = self.decoder(xt_emb)
             xt = torch.argmax(xt_logits, dim=-1)
             xt_emb = self.transformer.tok_emb(xt)
