@@ -381,4 +381,4 @@ def load_dataset(
         decimals=decimals,
         augment=augment,
     )
-    return dataset
+    return dataset, dataset_text
