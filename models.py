@@ -312,4 +312,4 @@ class SymbolicDiffusion(nn.Module):
         weighted_ce_loss = (ce_weight * ce_loss).mean()
 
         total_loss = mse_loss + weighted_ce_loss
-        return total_loss
+        return total_loss, mse_loss, weighted_ce_loss
