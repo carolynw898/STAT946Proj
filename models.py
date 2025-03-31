@@ -161,6 +161,7 @@ class SymbolicDiffusion(nn.Module):
         self.n_embd = n_embd
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
+        self.padding_idx = padding_idx
 
         self.tnet = tNet(pconfig)
         self.vars_emb = nn.Embedding(max_num_vars, n_embd)
@@ -307,7 +308,10 @@ class SymbolicDiffusion(nn.Module):
         tokens = F.one_hot(tokens, num_classes=self.vocab_size).float()
         ce_weight = 1.0 - (t.float() / self.timesteps)
         ce_loss = F.cross_entropy(
-            pred_logits.view(B, -1), tokens.view(B, -1), reduction="none"
+            pred_logits.view(B, -1),
+            tokens.view(B, -1),
+            reduction="none",
+            ignore_index=self.padding_idx,
         ).view(B, -1)
         weighted_ce_loss = (ce_weight * ce_loss).mean()
 
