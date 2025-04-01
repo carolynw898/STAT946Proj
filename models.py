@@ -301,18 +301,16 @@ class SymbolicDiffusion(nn.Module):
         t: torch.Tensor,  # [B]
     ) -> torch.Tensor:
         """Computes combined MSE (diffusion) and scheduled CE (token) loss."""
-        B = pred_logits.shape[0]
+        B, L = tokens.shape
         mse_loss = F.mse_loss(noise_pred, noise)
 
-        # one-hot encode the tokens
-        tokens = F.one_hot(tokens, num_classes=self.vocab_size).float()
         ce_weight = 1.0 - (t.float() / self.timesteps)
         ce_loss = F.cross_entropy(
-            pred_logits.view(B, -1),
-            tokens.view(B, -1),
+            pred_logits.view(-1, pred_logits.size(-1)),
+            tokens.view(-1),
             reduction="none",
             ignore_index=self.padding_idx,
-        ).view(B, -1)
+        ).view(B, L)
         weighted_ce_loss = (ce_weight * ce_loss).mean()
 
         total_loss = mse_loss + weighted_ce_loss
