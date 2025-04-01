@@ -311,7 +311,7 @@ class SymbolicDiffusion(nn.Module):
             reduction="none",
             ignore_index=self.padding_idx,
         ).view(B, L)
-        weighted_ce_loss = (ce_weight * ce_loss).mean()
+        weighted_ce_loss = (ce_weight.unsqueeze(1) * ce_loss).mean()
 
         total_loss = mse_loss + weighted_ce_loss
         return total_loss, mse_loss, weighted_ce_loss
