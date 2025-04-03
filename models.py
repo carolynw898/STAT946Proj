@@ -219,9 +219,6 @@ class SymbolicDiffusion(nn.Module):
     def round(self, xt):
         emb_table = self.tok_emb.weight
         idx = self.xtoi(xt)
-        print(idx.shape)
-        print(emb_table.shape)
-        print(emb_table[idx].shape)
         return emb_table[idx]
 
 
@@ -301,9 +298,10 @@ class SymbolicDiffusion(nn.Module):
         token_emb = self.tok_emb(tokens)
         xt, noise = self.q_sample(token_emb, t)
         noise_pred = self.transformer(xt, t, condition)
-        y_pred_emb = self.p_sample(xt, t, noise_pred)
-        y_pred_logits = self.decoder(y_pred_emb)
-        return y_pred_logits, noise_pred, noise
+        y_pred = self.p_sample(xt, t, noise_pred)
+        if self.train_decoder:
+            y_pred = self.decoder(y_pred)
+        return y_pred, noise_pred, noise
 
     @torch.no_grad()
     def sample(
@@ -345,12 +343,21 @@ class SymbolicDiffusion(nn.Module):
         self,
         noise_pred: torch.Tensor,  # [B, L, n_embd]
         noise: torch.Tensor,  # [B, L, n_embd]
-        pred_logits: torch.Tensor,  # [B, L, vocab_size]
+        pred: torch.Tensor,  # [B, L, vocab_size] or [B, L, n_embd]
         tokens: torch.Tensor,  # [B, L]
         t: torch.Tensor,  # [B]
+        verbose: bool = False
     ) -> torch.Tensor:
         """Computes combined MSE (diffusion) and scheduled CE (token) loss."""
         B, L = tokens.shape
+        if self.train_decoder:
+            assert pred_logits.shape == (B,L,self.vocab_size), \
+                f"Prediction is not in the correct shape: Expected {(B,L,self.vocab_size)} got {pred_logits.shape}"
+        else: 
+            assert pred_logits.shape == (B,L,self.n_embd), \
+                f"Prediction is not in the correct shape: Expected {(B,L,self.n_embd)} got {pred_logits.shape}\n Note: expected size is different if we are not training the decoder."
+
+
         mse_loss = F.mse_loss(noise_pred, noise)
 
         ce_weight = 1.0 - (t.float() / self.timesteps)
@@ -362,11 +369,21 @@ class SymbolicDiffusion(nn.Module):
                 ignore_index=self.padding_idx,
             ).view(B, L)
             weighted_ce_loss = (ce_weight.unsqueeze(1) * ce_loss).mean()
+            rounding_loss = 0.0
         else:
             weighted_ce_loss = torch.tensor(0.0)
+            rounding_loss = F.mse_loss(pred_logits, self.decoder(pred_logits))
 
-        total_loss = mse_loss + weighted_ce_loss
-        return total_loss, mse_loss, weighted_ce_loss
+        loss_components = torch.stack(
+            [mse_loss,
+             ce_loss,
+             rounding_loss])
+
+        if verbose:
+            print(loss_components)
+
+        total_loss = mse_loss + weighted_ce_loss + rounding_loss
+        return total_loss, *loss_components
 
 if __name__ == "__main__":
     # setting hyperparameters
@@ -386,8 +403,6 @@ if __name__ == "__main__":
     addVars = False
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vocab_size = 50
-
-
 
 
     import numpy as np
