@@ -178,7 +178,6 @@ class SymbolicDiffusion(nn.Module):
         if vars_emb_weights is not None:
             self.vars_emb.weight = nn.Parameter(vars_emb_weights, requires_grad=False)
 
-
         self.tnet = tNet(pconfig)
         self.transformer = NoisePredictionTransformer(
             vocab_size,
@@ -216,7 +215,6 @@ class SymbolicDiffusion(nn.Module):
         xt = sqrt_alpha_bar * x0 + sqrt_subone_alpha_bar * noise
         return xt, noise
 
-    @torch.no_grad()
     def p_sample(
         self,
         x: torch.Tensor,
