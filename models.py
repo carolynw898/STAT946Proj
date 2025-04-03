@@ -370,12 +370,15 @@ class SymbolicDiffusion(nn.Module):
                 ignore_index=self.padding_idx,
             ).view(B, L)
             weighted_ce_loss = (ce_weight.unsqueeze(1) * ce_loss).mean()
-            rounding_loss = 0.0
+            rounding_loss = torch.tensor(0.0, device=tokens.device)
         else:
-            weighted_ce_loss = torch.tensor(0.0)
+            weighted_ce_loss = torch.tensor(0.0, device=tokens.device)
             rounding_loss = F.mse_loss(pred_logits, self.decoder(pred_logits))
 
-        loss_components = torch.stack([mse_loss, ce_loss, rounding_loss])
+        loss_components = torch.stack(
+            [mse_loss,
+             weighted_ce_loss,
+             rounding_loss])
 
         if verbose:
             print(loss_components)
@@ -439,6 +442,8 @@ if __name__ == "__main__":
 
     y_pred_emb, noise_pred, noise = model(points, tokens, variables, t)
     generated_tokens = model.sample(points, variables, device)
+
+    loss, *loss_comps = model.loss_fn(noise_pred, noise, y_pred_emb, tokens, t)
     print("Predicted denoise: ------------- \n", y_pred_emb)
     print("Predicted noise  : ------------- \n", noise_pred)
     print("Actual noise     : ------------- \n", noise)
