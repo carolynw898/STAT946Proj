@@ -157,6 +157,7 @@ class SymbolicDiffusion(nn.Module):
         beta_end: float = 0.02,
         tok_emb_weights: torch.Tensor = None,
         vars_emb_weights: torch.Tensor = None,
+        train_decoder: bool = True
     ):
         super().__init__()
         self.timesteps = timesteps
@@ -188,11 +189,38 @@ class SymbolicDiffusion(nn.Module):
             n_embd=n_embd,
             max_timesteps=timesteps,
         )
-        self.decoder = nn.Linear(n_embd, vocab_size)
+
+        self.train_decoder = train_decoder
+        if train_decoder:
+            self.decoder = nn.Linear(n_embd, vocab_size)
+        else:
+            self.decoder = self.round
 
         self.register_buffer("beta", torch.linspace(beta_start, beta_end, timesteps))
         self.register_buffer("alpha", 1.0 - self.beta)
         self.register_buffer("alpha_bar", torch.cumprod(self.alpha, dim=0))
+
+
+
+    def xtoi(self, xt):
+        B, L, _ = xt.shape
+        emb_table = self.tok_emb.weight
+        
+        xt_flat = xt.view(B * L, -1)
+        xt_flat_norm = F.normalize(xt_flat, p=2, dim=1)
+        emb_table_norm = F.normalize(emb_table, p=2, dim=1)
+        
+        similarities = torch.matmul(xt_flat_norm, emb_table_norm.t())
+        nearest_indices = torch.argmax(similarities, dim=1).view(B,L)
+        
+        return nearest_indices
+    
+
+    def round(self, xt):
+        emb_table = self.tok_emb.weight
+        idx = self.xtoi(xt)
+        return emb_table[idx]
+
 
     def q_sample(
         self,
@@ -270,9 +298,10 @@ class SymbolicDiffusion(nn.Module):
         token_emb = self.tok_emb(tokens)
         xt, noise = self.q_sample(token_emb, t)
         noise_pred = self.transformer(xt, t, condition)
-        y_pred_emb = self.p_sample(xt, t, noise_pred)
-        y_pred_logits = self.decoder(y_pred_emb)
-        return y_pred_logits, noise_pred, noise
+        y_pred = self.p_sample(xt, t, noise_pred)
+        if self.train_decoder:
+            y_pred = self.decoder(y_pred)
+        return y_pred, noise_pred, noise
 
     @torch.no_grad()
     def sample(
@@ -300,31 +329,119 @@ class SymbolicDiffusion(nn.Module):
             t_tensor.fill_(t)  # Update in-place: [B] all set to t
             noise_pred = self.transformer(xt_emb, t_tensor, condition)
             xt_emb = self.p_sample(xt_emb, t, noise_pred)  # t as int for p_sample
-            xt_logits = self.decoder(xt_emb)
-            xt = torch.argmax(xt_logits, dim=-1)
-            xt_emb = self.tok_emb(xt)
+            if self.train_decoder:
+                xt_logits = self.decoder(xt_emb)
+                xt = torch.argmax(xt_logits, dim=-1)
+                xt_emb = self.tok_emb(xt)
+            else:
+                xt_emb = self.round(xt_emb)
+
+        xt = self.xtoi(xt_emb)
         return xt
 
     def loss_fn(
         self,
         noise_pred: torch.Tensor,  # [B, L, n_embd]
         noise: torch.Tensor,  # [B, L, n_embd]
-        pred_logits: torch.Tensor,  # [B, L, vocab_size]
+        pred: torch.Tensor,  # [B, L, vocab_size] or [B, L, n_embd]
         tokens: torch.Tensor,  # [B, L]
         t: torch.Tensor,  # [B]
+        verbose: bool = False
     ) -> torch.Tensor:
         """Computes combined MSE (diffusion) and scheduled CE (token) loss."""
         B, L = tokens.shape
+        if self.train_decoder:
+            assert pred_logits.shape == (B,L,self.vocab_size), \
+                f"Prediction is not in the correct shape: Expected {(B,L,self.vocab_size)} got {pred_logits.shape}"
+        else: 
+            assert pred_logits.shape == (B,L,self.n_embd), \
+                f"Prediction is not in the correct shape: Expected {(B,L,self.n_embd)} got {pred_logits.shape}\n Note: expected size is different if we are not training the decoder."
+
+
         mse_loss = F.mse_loss(noise_pred, noise)
 
         ce_weight = 1.0 - (t.float() / self.timesteps)
-        ce_loss = F.cross_entropy(
-            pred_logits.view(-1, pred_logits.size(-1)),
-            tokens.view(-1),
-            reduction="none",
-            ignore_index=self.padding_idx,
-        ).view(B, L)
-        weighted_ce_loss = (ce_weight.unsqueeze(1) * ce_loss).mean()
+        if self.train_decoder:
+            ce_loss = F.cross_entropy(
+                pred_logits.view(-1, pred_logits.size(-1)),
+                tokens.view(-1),
+                reduction="none",
+                ignore_index=self.padding_idx,
+            ).view(B, L)
+            weighted_ce_loss = (ce_weight.unsqueeze(1) * ce_loss).mean()
+            rounding_loss = 0.0
+        else:
+            weighted_ce_loss = torch.tensor(0.0)
+            rounding_loss = F.mse_loss(pred_logits, self.decoder(pred_logits))
 
-        total_loss = mse_loss + weighted_ce_loss
-        return total_loss, mse_loss, weighted_ce_loss
+        loss_components = torch.stack(
+            [mse_loss,
+             ce_loss,
+             rounding_loss])
+
+        if verbose:
+            print(loss_components)
+
+        total_loss = mse_loss + weighted_ce_loss + rounding_loss
+        return total_loss, *loss_components
+
+if __name__ == "__main__":
+    # setting hyperparameters
+    n_embd = 64
+    timesteps = 1000
+    batch_size = 64
+    learning_rate = 6e-4
+    num_epochs = 5
+    blockSize = 32
+    numVars = 1
+    numYs = 1
+    numPoints = 250
+    target = 'Skeleton'
+    const_range = [-2.1, 2.1]
+    trainRange = [-3.0, 3.0]
+    decimals = 8
+    addVars = False
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vocab_size = 50
+
+
+    import numpy as np
+    import glob
+    import random
+
+    pconfig = PointNetConfig(
+        embeddingSize=n_embd,
+        numberofPoints=numPoints,
+        numberofVars=numVars,
+        numberofYs=numYs,
+    )
+    
+    model = SymbolicDiffusion(
+        pconfig=pconfig,
+        vocab_size=50,
+        max_seq_len=blockSize,
+        padding_idx=1,
+        max_num_vars=9,
+        n_layer=4,
+        n_head=4,
+        n_embd=n_embd,
+        timesteps=timesteps,
+        beta_start=0.0001,
+        beta_end=0.02,
+        train_decoder = False,
+    ).to(device)
+
+    tokens = torch.randint(0, vocab_size, (batch_size, blockSize),device=device)
+    points = torch.randn((batch_size, 2, numPoints),device=device)
+    variables = torch.randint(0, 9, (batch_size,),device=device)
+
+    print(variables.shape)
+
+    t = torch.randint(0, timesteps, (tokens.shape[0],), device=device)
+                
+    y_pred_emb, noise_pred, noise = model(points, tokens, variables, t)
+    generated_tokens = model.sample(points, variables, device)
+    print("Predicted denoise: ------------- \n", y_pred_emb)
+    print("Predicted noise  : ------------- \n", noise_pred)
+    print("Actual noise     : ------------- \n", noise)
+    print("Generated tokens : ------------- \n", generated_tokens)
