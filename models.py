@@ -94,9 +94,9 @@ class NoisePredictionTransformer(nn.Module):
         max_timesteps: int = 1000,
     ):
         super().__init__()
-        self.tok_emb = nn.Embedding(
-            vocab_size, n_embd, padding_idx=torch.tensor(padding_idx, dtype=torch.long)
-        )
+        # self.tok_emb = nn.Embedding(
+        #     vocab_size, n_embd, padding_idx=torch.tensor(padding_idx, dtype=torch.long)
+        # )
         self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, n_embd))
         self.time_emb = nn.Embedding(max_timesteps, n_embd)
 
@@ -155,6 +155,8 @@ class SymbolicDiffusion(nn.Module):
         timesteps: int = 1000,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
+        tok_emb_weights: torch.Tensor = None,
+        vars_emb_weights: torch.Tensor = None,
     ):
         super().__init__()
         self.timesteps = timesteps
@@ -162,9 +164,22 @@ class SymbolicDiffusion(nn.Module):
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
         self.padding_idx = padding_idx
+        self.tok_emb_weights = tok_emb_weights
+        self.vars_emb_weights = vars_emb_weights
+
+        # Initialize embedding layers
+        self.tok_emb = nn.Embedding(vocab_size, n_embd, padding_idx=padding_idx)
+        self.vars_emb = nn.Embedding(max_num_vars, n_embd)
+
+        # Load and freeze (requires_grad = False ensures they won't be updated) weights if provided
+        if tok_emb_weights is not None:
+            self.tok_emb.weight = nn.Parameter(tok_emb_weights, requires_grad=False)
+
+        if vars_emb_weights is not None:
+            self.vars_emb.weight = nn.Parameter(vars_emb_weights, requires_grad=False)
+
 
         self.tnet = tNet(pconfig)
-        self.vars_emb = nn.Embedding(max_num_vars, n_embd)
         self.transformer = NoisePredictionTransformer(
             vocab_size,
             max_seq_len,
@@ -254,12 +269,12 @@ class SymbolicDiffusion(nn.Module):
         vars_emb = self.vars_emb(variables)
         condition = condition + vars_emb
 
-        token_emb = self.transformer.tok_emb(tokens)
+        token_emb = self.tok_emb(tokens)
         xt, noise = self.q_sample(token_emb, t)
         noise_pred = self.transformer(xt, t, condition)
         y_pred_emb = self.p_sample(xt, t, noise_pred)
-        # y_pred_logits = self.decoder(y_pred_emb)
-        return y_pred_emb, noise_pred, noise
+        y_pred_logits = self.decoder(y_pred_emb)
+        return y_pred_logits, noise_pred, noise
 
     @torch.no_grad()
     def sample(
