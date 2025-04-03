@@ -328,38 +328,3 @@ class SymbolicDiffusion(nn.Module):
 
         total_loss = mse_loss + weighted_ce_loss
         return total_loss, mse_loss, weighted_ce_loss
-
-    def loss_fn_rnd(
-        self,
-        noise_pred: torch.Tensor,  # [B, L, n_embd]
-        noise: torch.Tensor,  # [B, L, n_embd]
-        y_pred_emb: torch.Tensor,  # [B, L, n_embd]
-        tokens: torch.Tensor,  # [B, L]
-        t: torch.Tensor,  # [B]
-    ) -> torch.Tensor:
-        """Computes combined MSE (diffusion) and scheduled CE (token) loss."""
-        B, L = tokens.shape
-        mse_loss = F.mse_loss(noise_pred, noise)
-
-        emb_table = self.transformer.tok_emb.weight
-
-        y_pred_emb_flat = y_pred_emb.view(B * L, -1)
-        distances = torch.cdist(y_pred_emb_flat, emb_table)
-
-        nearest_indices = torch.argmin(distances, dim=1)
-
-        rounded_emb = emb_table[nearest_indices]
-
-        pred_logits = rounded_emb @ emb_table.T
-
-        ce_weight = 1.0 - (t.float() / self.timesteps)
-        ce_loss = F.cross_entropy(
-            pred_logits,  # [B*L, vocab_size]
-            tokens.view(-1),  # [B*L]
-            reduction="none",
-            ignore_index=self.padding_idx,
-        ).view(B, L)
-        weighted_ce_loss = (ce_weight.unsqueeze(1) * ce_loss).mean()
-
-        total_loss = mse_loss + weighted_ce_loss
-        return total_loss, mse_loss, weighted_ce_loss
