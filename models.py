@@ -304,7 +304,7 @@ class SymbolicDiffusion(nn.Module):
             xt_emb = self.p_sample(xt_emb, t, noise_pred)  # t as int for p_sample
             xt_logits = self.decoder(xt_emb)
             xt = torch.argmax(xt_logits, dim=-1)
-            xt_emb = self.transformer.tok_emb(xt)
+            xt_emb = self.tok_emb(xt)
         return xt
 
     def loss_fn(
