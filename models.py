@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing import Tuple
+from utils import CharDataset
+from sympy import sympify, SympifyError
 
 
 # from SymbolicGPT: https://github.com/mojivalipour/symbolicgpt/blob/master/models.py
@@ -299,6 +301,39 @@ class SymbolicDiffusion(nn.Module):
             y_pred = self.decoder(y_pred)
         return y_pred, noise_pred, noise
 
+    def validate_expressions(self, expressions: list[str]) -> torch.Tensor:
+        """Validates generated expressions, assigning penalties without raising exceptions."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        penalties = torch.zeros(len(expressions), device=device)
+        for i, expr in enumerate(expressions):
+            try:
+                # Ensure expr is a string and not empty
+                if not isinstance(expr, str) or not expr.strip():
+                    raise ValueError("Empty or non-string expression")
+                sympify(expr, evaluate=False)
+            except Exception as e:
+                penalties[i] = 1.0
+        return penalties
+
+    def logits_to_expression(
+        self, pred_logits: torch.Tensor, train_dataset: CharDataset
+    ) -> list[str]:
+        """Converts token indices to a symbolic expression."""
+        generated_tokens = torch.argmax(pred_logits, dim=-1)  # [B, L]
+        B, _ = generated_tokens.shape
+        expressions = []
+        for i in range(B):
+            predicted_tokens = generated_tokens[i].detach().cpu().numpy()
+            predicted = "".join(
+                [train_dataset.itos[int(idx)] for idx in predicted_tokens]
+            )
+            predicted = predicted.strip(train_dataset.paddingToken).split(">")
+            predicted = predicted[0] if len(predicted[0]) >= 1 else predicted[1]
+            predicted = predicted.strip("<").strip(">")
+            predicted = predicted.replace("Ce", "")
+            expressions.append(predicted)
+        return expressions
+
     @torch.no_grad()
     def sample(
         self,
@@ -332,8 +367,17 @@ class SymbolicDiffusion(nn.Module):
             else:
                 xt_emb = self.round(xt_emb)
 
+        if self.train_decoder:
+            return xt
+
         xt = self.xtoi(xt_emb)
         return xt
+
+    def validity_loss(self, pred_logits: torch.Tensor, train_dataset: CharDataset):
+        """Compute validity penalty, detaching for string operations."""
+        expressions = self.logits_to_expression(pred_logits.detach(), train_dataset)
+        penalties = self.validate_expressions(expressions)
+        return penalties
 
     def loss_fn(
         self,
@@ -342,109 +386,63 @@ class SymbolicDiffusion(nn.Module):
         pred_logits: torch.Tensor,  # [B, L, vocab_size] or [B, L, n_embd]
         tokens: torch.Tensor,  # [B, L]
         t: torch.Tensor,  # [B]
+        train_dataset: CharDataset,
         verbose: bool = False,
     ) -> torch.Tensor:
-        """Computes combined MSE (diffusion) and scheduled CE (token) loss."""
+        """Computes combined MSE (diffusion), scheduled CE (token), and validity loss."""
         B, L = tokens.shape
+        device = tokens.device
+
         if self.train_decoder:
             assert pred_logits.shape == (
                 B,
                 L,
                 self.vocab_size,
-            ), f"Prediction is not in the correct shape: Expected {(B,L,self.vocab_size)} got {pred_logits.shape}"
+            ), f"Prediction is not in the correct shape: Expected {(B, L, self.vocab_size)}, got {pred_logits.shape}"
         else:
             assert pred_logits.shape == (
                 B,
                 L,
                 self.n_embd,
-            ), f"Prediction is not in the correct shape: Expected {(B,L,self.n_embd)} got {pred_logits.shape}\n Note: expected size is different if we are not training the decoder."
+            ), f"Prediction is not in the correct shape: Expected {(B, L, self.n_embd)}, got {pred_logits.shape}"
 
+        # Noise prediction loss (diffusion objective)
         mse_loss = F.mse_loss(noise_pred, noise)
 
-        ce_weight = 1.0 - (t.float() / self.timesteps)
+        # Scheduling weight
+        weight = 1.0 - (t.float() / self.timesteps)  # [B]
+
+        # Token prediction or rounding loss
         if self.train_decoder:
             ce_loss = F.cross_entropy(
-                pred_logits.view(-1, pred_logits.size(-1)),
-                tokens.view(-1),
+                pred_logits.view(-1, pred_logits.size(-1)),  # [B*L, vocab_size]
+                tokens.view(-1),  # [B*L]
                 reduction="none",
                 ignore_index=self.padding_idx,
-            ).view(B, L)
-            weighted_ce_loss = (ce_weight.unsqueeze(1) * ce_loss).mean()
-            rounding_loss = torch.tensor(0.0, device=tokens.device)
+            ).view(
+                B, L
+            )  # [B, L]
+            weighted_ce_loss = (weight.unsqueeze(1) * ce_loss).mean()  # Scalar
+            rounding_loss = torch.tensor(0.0, device=device)
         else:
-            weighted_ce_loss = torch.tensor(0.0, device=tokens.device)
-            rounding_loss = F.mse_loss(pred_logits, self.decoder(pred_logits))
+            weighted_ce_loss = torch.tensor(0.0, device=device)
+            rounding_loss = F.mse_loss(
+                pred_logits, self.decoder(pred_logits)
+            )  # [B, L, n_embd]
+
+        penalties = self.validity_loss(pred_logits, train_dataset)
+        validity_loss = penalties.mean()
 
         loss_components = torch.stack(
-            [mse_loss,
-             weighted_ce_loss,
-             rounding_loss])
+            [mse_loss, weighted_ce_loss, rounding_loss, validity_loss]
+        )
+
+        total_loss = mse_loss + weighted_ce_loss + rounding_loss + validity_loss
 
         if verbose:
-            print(loss_components)
+            print(
+                f"Loss Components: MSE={mse_loss.item():.4f}, CE={weighted_ce_loss.item():.4f}, "
+                f"Round={rounding_loss.item():.4f}, Validity={validity_loss.item():.4f}"
+            )
 
-        total_loss = mse_loss + weighted_ce_loss + rounding_loss
         return total_loss, *loss_components
-
-
-if __name__ == "__main__":
-    # setting hyperparameters
-    n_embd = 64
-    timesteps = 1000
-    batch_size = 64
-    learning_rate = 6e-4
-    num_epochs = 5
-    blockSize = 32
-    numVars = 1
-    numYs = 1
-    numPoints = 250
-    target = "Skeleton"
-    const_range = [-2.1, 2.1]
-    trainRange = [-3.0, 3.0]
-    decimals = 8
-    addVars = False
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    vocab_size = 50
-
-    import numpy as np
-    import glob
-    import random
-
-    pconfig = PointNetConfig(
-        embeddingSize=n_embd,
-        numberofPoints=numPoints,
-        numberofVars=numVars,
-        numberofYs=numYs,
-    )
-
-    model = SymbolicDiffusion(
-        pconfig=pconfig,
-        vocab_size=50,
-        max_seq_len=blockSize,
-        padding_idx=1,
-        max_num_vars=9,
-        n_layer=4,
-        n_head=4,
-        n_embd=n_embd,
-        timesteps=timesteps,
-        beta_start=0.0001,
-        beta_end=0.02,
-        train_decoder=False,
-    ).to(device)
-
-    tokens = torch.randint(0, vocab_size, (batch_size, blockSize), device=device)
-    points = torch.randn((batch_size, 2, numPoints), device=device)
-    variables = torch.randint(0, 9, (batch_size,), device=device)
-
-    print(variables.shape)
-
-    t = torch.randint(0, timesteps, (tokens.shape[0],), device=device)
-
-    y_pred_emb, noise_pred, noise = model(points, tokens, variables, t)
-    generated_tokens = model.sample(points, variables, device)
-
-    loss, *loss_comps = model.loss_fn(noise_pred, noise, y_pred_emb, tokens, t)
-    print("Predicted denoise: ------------- \n", y_pred_emb)
-    print("Predicted noise  : ------------- \n", noise_pred)
-    print("Actual noise     : ------------- \n", noise)
-    print("Generated tokens : ------------- \n", generated_tokens)
