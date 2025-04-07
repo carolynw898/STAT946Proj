@@ -158,6 +158,7 @@ class SymbolicDiffusion(nn.Module):
         tok_emb_weights: torch.Tensor = None,
         vars_emb_weights: torch.Tensor = None,
         train_decoder: bool = True,
+        p_uncond: float = 0.2
     ):
         super().__init__()
         self.timesteps = timesteps
@@ -167,6 +168,7 @@ class SymbolicDiffusion(nn.Module):
         self.padding_idx = padding_idx
         self.tok_emb_weights = tok_emb_weights
         self.vars_emb_weights = vars_emb_weights
+        self.p_uncond = p_uncond
 
         # Initialize embedding layers
         self.tok_emb = nn.Embedding(vocab_size, n_embd, padding_idx=padding_idx)
@@ -193,8 +195,6 @@ class SymbolicDiffusion(nn.Module):
         self.train_decoder = train_decoder
         if train_decoder:
             self.decoder = nn.Linear(n_embd, vocab_size)
-        else:
-            self.decoder = self.round
 
         self.register_buffer("beta", torch.linspace(beta_start, beta_end, timesteps))
         self.register_buffer("alpha", 1.0 - self.beta)
@@ -202,16 +202,22 @@ class SymbolicDiffusion(nn.Module):
 
     def xtoi(self, xt):
         B, L, _ = xt.shape
-        emb_table = self.tok_emb.weight
+        emb_table = self.tok_emb.weight  # [vocab_size, n_embd]
 
-        xt_flat = xt.view(B * L, -1)
-        xt_flat_norm = F.normalize(xt_flat, p=2, dim=1)
-        emb_table_norm = F.normalize(emb_table, p=2, dim=1)
+        # Flatten xt to [B*L, n_embd]
+        xt_flat = xt.view(B * L, -1)  # [B*L, n_embd]
 
-        similarities = torch.matmul(xt_flat_norm, emb_table_norm.t())
-        nearest_indices = torch.argmax(similarities, dim=1).view(B, L)
+        # Compute Euclidean distances
+        # Expand dimensions to broadcast: [B*L, 1, n_embd] - [1, vocab_size, n_embd]
+        diffs = xt_flat.unsqueeze(1) - emb_table.unsqueeze(0)  # [B*L, vocab_size, n_embd]
+        distances = torch.norm(diffs, p=2, dim=2)  # [B*L, vocab_size], L2 norm along n_embd
+
+        # Find the nearest embedding indices (smallest distance)
+        nearest_indices = torch.argmin(distances, dim=1)  # [B*L]
+        nearest_indices = nearest_indices.view(B, L)  # Reshape to [B, L]
 
         return nearest_indices
+
 
     def round(self, xt):
         emb_table = self.tok_emb.weight
@@ -242,21 +248,20 @@ class SymbolicDiffusion(nn.Module):
     def p_sample(
         self,
         x: torch.Tensor,
-        t: int,
+        t: torch.Tensor,
         noise_pred: torch.Tensor,
     ) -> torch.Tensor:
         """Denoises the noisy embeddings at time t.
 
         Args:
             x: [B, L, n_embd] - Noisy embeddings at time t
-            t: int - Current timestep (scalar)
+            t: torch.Tensor - Current timestep (scalar)
             condition: [B, n_embd] - Combined T-Net and variable embeddings
             device: str - Device to use (e.g., "cuda")
 
         Returns:
             x: [B, L, n_embd] - Denoised embeddings
         """
-        B = x.shape[0]
         beta_t = self.beta[t].view(-1, 1, 1)
         alpha_t = self.alpha[t].view(-1, 1, 1)
         alpha_bar_t = self.alpha_bar[t].view(-1, 1, 1)
@@ -265,75 +270,98 @@ class SymbolicDiffusion(nn.Module):
         )
         return mean
 
+
     def forward(
-        self,
-        points: torch.Tensor,
-        tokens: torch.Tensor,
-        variables: torch.Tensor,
-        t: torch.Tensor,
+            self,
+            points: torch.Tensor,
+            tokens: torch.Tensor,
+            variables: torch.Tensor,
+            t: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Training forward pass to predict noise added to embeddings.
-
+        
         Args:
-            points: [B, 2, 250] - Dataset points for conditioning
-            tokens: [B, L] - Ground truth expression (token indices)
-            variables: [B] - Number of variables per sample
-            t: [B] - Timestep
-
+        points: [B, 2, 250] - Dataset points for conditioning
+        tokens: [B, L] - Ground truth expression (token indices)
+        variables: [B] - Number of variables per sample
+        t: [B] - Timestep
+        
         Returns:
-            y_pred: [B, L] - Generated expression (token indices)
-            noise_pred: [B, L, n_embd] - Predicted noise
-            noise: [B, L, n_embd] - Actual noise added
+        y_pred: [B, L] - Generated expression (token indices)
+        noise_pred: [B, L, n_embd] - Predicted noise
+        noise: [B, L, n_embd] - Actual noise added
         """
         B = tokens.shape[0]
-
-        condition = self.tnet(points)
-        vars_emb = self.vars_emb(variables)
-        condition = condition + vars_emb
-
+        
+        tnet_output = self.tnet(points)  # [B, n_embd]
+        vars_emb = self.vars_emb(variables)  # [B, n_embd]
+        condition = tnet_output + vars_emb  # Full condition: points + variables
+        
+        # Randomly drop the points' contribution with probability p_uncond
+        mask = torch.rand(B, device=condition.device) < self.p_uncond
+        condition = torch.where(mask[:, None], vars_emb, condition)  # Unconditional: only variables
+        
         token_emb = self.tok_emb(tokens)
         xt, noise = self.q_sample(token_emb, t)
         noise_pred = self.transformer(xt, t, condition)
         y_pred = self.p_sample(xt, t, noise_pred)
+
         if self.train_decoder:
             y_pred = self.decoder(y_pred)
+
         return y_pred, noise_pred, noise
 
     @torch.no_grad()
     def sample(
-        self,
-        points: torch.Tensor,
-        variables: torch.Tensor,
-        device: str = "cuda",
+            self,
+            points: torch.Tensor,
+            variables: torch.Tensor,
+            device: str = "cuda",
+            guidance_scale: float = 1.0,  # Added parameter for guidance strength
     ) -> torch.Tensor:
-        """Generates a sample by denoising from random noise.
-
+        """Generates a sample by denoising from random noise with classifier-free guidance.
+        
         Args:
-            points: [B, 2, 250] - Dataset points for conditioning
-            variables: [B] - Number of variables per sample
-            device: str - Device to use (e.g., "cuda")
-
+        points: [B, 2, 250] - Dataset points for conditioning
+        variables: [B] - Number of variables per sample
+        device: str - Device to use (e.g., "cuda")
+        guidance_scale: float - Strength of guidance (default 1.0, no extra guidance)
+        
         Returns:
-            xt: [B, L] - Generated expression (token indices)
+        xt: [B, L] - Generated expression (token indices)
         """
-        condition = self.tnet(points) + self.vars_emb(variables)  # [B, n_embd]
-        B = condition.shape[0]
-
+        B = points.shape[0]
+        
+        # Precompute conditions outside the loop
+        condition_cond = self.tnet(points) + self.vars_emb(variables)  # [B, n_embd], conditional
+        condition_uncond = self.vars_emb(variables)  # [B, n_embd], unconditional
+        condition_batch = torch.cat([condition_cond, condition_uncond], dim=0)  # [2B, n_embd]
+        
         xt_emb = torch.randn(B, self.max_seq_len, self.n_embd, device=device)
         t_tensor = torch.zeros(B, dtype=torch.long, device=device)  # [B]
         for t in range(self.timesteps - 1, -1, -1):
             t_tensor.fill_(t)  # Update in-place: [B] all set to t
-            noise_pred = self.transformer(xt_emb, t_tensor, condition)
+            # Batch conditional and unconditional inputs
+            xt_emb_batch = xt_emb.repeat(2, 1, 1)  # [2B, L, n_embd]
+            t_batch = t_tensor.repeat(2)  # [2B]
+            noise_pred_batch = self.transformer(xt_emb_batch, t_batch, condition_batch)  # [2B, L, n_embd]
+            
+            # Split predictions
+            noise_pred_cond = noise_pred_batch[:B]  # [B, L, n_embd]
+            noise_pred_uncond = noise_pred_batch[B:]  # [B, L, n_embd]
+            
+            # Apply classifier-free guidance
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            
             xt_emb = self.p_sample(xt_emb, t, noise_pred)  # t as int for p_sample
             if self.train_decoder:
                 xt_logits = self.decoder(xt_emb)
                 xt = torch.argmax(xt_logits, dim=-1)
                 xt_emb = self.tok_emb(xt)
-            else:
-                xt_emb = self.round(xt_emb)
-
+                
         xt = self.xtoi(xt_emb)
         return xt
+
 
     def loss_fn(
         self,
@@ -343,7 +371,7 @@ class SymbolicDiffusion(nn.Module):
         tokens: torch.Tensor,  # [B, L]
         t: torch.Tensor,  # [B]
         verbose: bool = False,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor]:
         """Computes combined MSE (diffusion) and scheduled CE (token) loss."""
         B, L = tokens.shape
         if self.train_decoder:
@@ -373,7 +401,7 @@ class SymbolicDiffusion(nn.Module):
             rounding_loss = torch.tensor(0.0, device=tokens.device)
         else:
             weighted_ce_loss = torch.tensor(0.0, device=tokens.device)
-            rounding_loss = F.mse_loss(pred_logits, self.decoder(pred_logits))
+            rounding_loss = F.mse_loss(pred_logits, self.round(pred_logits))
 
         loss_components = torch.stack(
             [mse_loss,
