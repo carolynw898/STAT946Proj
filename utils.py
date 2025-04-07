@@ -67,16 +67,35 @@ def processDataFiles(files):
     return text
 
 
+def tokenize_equation(eq):
+    token_spec = [
+        (r'\*\*'),                # exponentiation
+        (r'exp'),                 # exp function
+        (r'[+\-*/=()]'),          # operators and parentheses
+        (r'sin'),                 # sin function
+        (r'cos'),                 # cos function
+        (r'log'),                 # log function
+        (r'x\d+'),                # variables like x1, x23, etc.
+        (r'C'),                   # constants placeholder
+        (r'-?\d+\.\d+'),          # decimal numbers
+        (r'-?\d+'),               # integers
+        (r'_'),                   # padding token
+    ]
+    token_regex = '|'.join(f'({pattern})' for pattern in token_spec)
+    matches = re.finditer(token_regex, eq)
+    return [match.group(0) for match in matches]
+
+
 class CharDataset(Dataset):
     def __init__(
         self,
         data,
         block_size,
-        chars,
+        tokens,
         numVars,
         numYs,
         numPoints,
-        target="EQ",
+        target="Skeleton",
         addVars=False,
         const_range=[-0.4, 0.4],
         xRange=[-3.0, 3.0],
@@ -84,11 +103,12 @@ class CharDataset(Dataset):
         augment=False,
     ):
 
-        data_size, vocab_size = len(data), len(chars)
+        data_size, vocab_size = len(data), len(tokens)
         print("data has %d examples, %d unique." % (data_size, vocab_size))
 
-        self.stoi = {ch: i for i, ch in enumerate(chars)}
-        self.itos = {i: ch for i, ch in enumerate(chars)}
+        self.stoi = {tok: i for i, tok in enumerate(tokens)}
+        self.itos = {i: tok for i, tok in enumerate(tokens)}
+
 
         self.numVars = numVars
         self.numYs = numYs
@@ -96,9 +116,10 @@ class CharDataset(Dataset):
 
         # padding token
         self.paddingToken = "_"
-        self.paddingID = self.stoi[self.paddingToken]
+        self.paddingID = len(self.stoi)  # or another ID not already used
         self.stoi[self.paddingToken] = self.paddingID
         self.itos[self.paddingID] = self.paddingToken
+
         self.threshold = [-1000, 1000]
 
         self.block_size = block_size
@@ -202,7 +223,13 @@ class CharDataset(Dataset):
         if self.addVars:
             dix = [self.stoi[s] for s in "<" + str(numVars) + ":" + eq + ">"]
         else:
-            dix = [self.stoi[s] for s in "<" + eq + ">"]
+            eq_tokens = tokenize_equation(eq)
+            if self.addVars:
+                token_seq = ["<", str(numVars), ":", *eq_tokens, ">"]
+            else:
+                token_seq = ["<", *eq_tokens, ">"]
+            dix = [self.stoi[tok] for tok in token_seq]
+
         inputs = dix[:-1]
         outputs = dix[1:]
 
@@ -216,11 +243,6 @@ class CharDataset(Dataset):
         inputs = inputs[: self.block_size]
         outputs = outputs[: self.block_size]
 
-        # extract points from the input sequence
-        # maxX = max(chunk['X'])
-        # maxY = max(chunk['Y'])
-        # minX = min(chunk['X'])
-        # minY = min(chunk['Y'])
         points = torch.zeros(self.numVars + self.numYs, self.numPoints - 1)
         for idx, xy in enumerate(zip(chunk["X"], chunk["Y"])):
 
@@ -235,12 +257,10 @@ class CharDataset(Dataset):
                 break
 
             x = xy[0]
-            # x = [(e-minX[eID])/(maxX[eID]-minX[eID]+eps) for eID, e in enumerate(x)] # normalize x
             x = x + [0] * (max(self.numVars - len(x), 0))  # padding
 
             y = [xy[1]] if type(xy[1]) == float or type(xy[1]) == np.float64 else xy[1]
 
-            # y = [(e-minY)/(maxY-minY+eps) for e in y]
             y = y + [0] * (max(self.numYs - len(y), 0))  # padding
             p = x + y  # because it is only one point
             p = torch.tensor(p)
@@ -251,30 +271,15 @@ class CharDataset(Dataset):
                 posinf=self.threshold[1],
                 neginf=self.threshold[0],
             )
-            # p[p>self.threshold[1]] = self.threshold[1] # clip the upper bound
-            # p[p<self.threshold[0]] = self.threshold[0] # clip the lower bound
+            
             points[:, idx] = p
 
-        # Normalize points between zero and one # DxN
-        # minP = points.min(dim=1, keepdim=True)[0]
-        # maxP = points.max(dim=1, keepdim=True)[0]
-        # points -= minP
-        # points /= (maxP-minP+eps)
-        # if printInfoCondition:
-        #     print(f'Points: {points}')
-
-        # points -= points.mean()
-        # points /= points.std()
         points = torch.nan_to_num(
             points,
             nan=self.threshold[1],
             posinf=self.threshold[1],
             neginf=self.threshold[0],
         )
-
-        # if printInfoCondition:
-        #     print(f'Points: {points}')
-        # points += torch.normal(0, 0.05, size=points.shape) # add a guassian noise
 
         inputs = torch.tensor(inputs, dtype=torch.long)
         outputs = torch.tensor(outputs, dtype=torch.long)
