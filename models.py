@@ -317,7 +317,7 @@ class SymbolicDiffusion(nn.Module):
             points: torch.Tensor,
             variables: torch.Tensor,
             device: str = "cuda",
-            guidance_scale: float = 1.0,  # Added parameter for guidance strength
+            guidance_scale: float = 0.5,  # Added parameter for guidance strength
     ) -> torch.Tensor:
         """Generates a sample by denoising from random noise with classifier-free guidance.
         
