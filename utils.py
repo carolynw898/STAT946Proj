@@ -333,3 +333,14 @@ def lossFunc(constants, eq, X, Y, eps=1e-5):
 
     err /= len(Y)
     return err
+
+
+def get_predicted_skeleton(generated_tokens, train_dataset: CharDataset):
+    predicted_tokens = generated_tokens.cpu().numpy()
+    predicted = "".join([train_dataset.itos[int(idx)] for idx in predicted_tokens])
+    predicted = predicted.strip(train_dataset.paddingToken).split(">")
+    predicted = predicted[0] if len(predicted[0]) >= 1 else predicted[1]
+    predicted = predicted.strip("<").strip(">")
+    predicted = predicted.replace("Ce", "C*e")
+
+    return predicted
