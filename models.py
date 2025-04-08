@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from tqdm import tqdm
+from utils import get_predicted_skeleton
 
 
 # from SymbolicGPT: https://github.com/mojivalipour/symbolicgpt/blob/master/models.py
@@ -181,13 +182,11 @@ class SymbolicGaussianDiffusion(nn.Module):
         return mean + torch.sqrt(variance) * noise
 
     @torch.no_grad()
-    def sample(self, points, variables, batch_size=16):
+    def sample(self, points, variables, train_dataset, batch_size=16):
         condition = self.tnet(points) + self.vars_emb(variables)
         shape = (batch_size, self.max_seq_len, self.n_embd)
         x = torch.randn(shape, device=self.device)
-        steps = torch.arange(
-            self.timesteps - 1, -1, -1, device=self.device
-        )  # Fix: start at timesteps-1
+        steps = torch.arange(self.timesteps - 1, -1, -1, device=self.device)
 
         for i in tqdm(
             range(self.timesteps), desc="sampling loop", total=self.timesteps
@@ -200,9 +199,25 @@ class SymbolicGaussianDiffusion(nn.Module):
             )
             x = self.p_sample(x, t, t_next, condition)
 
+            # Print prediction every 250 steps
+            if (i + 1) % 250 == 0:
+                logits = self.decoder(x)  # [B, L, vocab_size]
+                token_indices = torch.argmax(logits, dim=-1)  # [B, L]
+                for j in range(batch_size):
+                    token_indices_j = token_indices[j]  # [L]
+                    predicted_skeleton = get_predicted_skeleton(
+                        token_indices_j, train_dataset
+                    )
+                    tqdm.write(f" sample {j}: predicted_skeleton: {predicted_skeleton}")
+
         logits = self.decoder(x)  # [B, L, vocab_size]
         token_indices = torch.argmax(logits, dim=-1)  # [B, L]
-        return token_indices
+        predicted_skeletons = []
+        for j in range(batch_size):
+            token_indices_j = token_indices[j]  # [L]
+            predicted_skeleton = get_predicted_skeleton(token_indices_j, train_dataset)
+            predicted_skeletons.append(predicted_skeleton)
+        return predicted_skeletons
 
     def p_losses(
         self, x_start, points, tokens, variables, t, noise=None, mse: bool = False
