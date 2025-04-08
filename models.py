@@ -1,9 +1,6 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from typing import Tuple
-from utils import CharDataset
-from sympy import sympify, SympifyError
 from tqdm import tqdm
 
 
@@ -98,7 +95,7 @@ class NoisePredictionTransformer(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layer)
 
     def forward(self, x_t, t, condition):
-        B, L, _ = x_t.shape
+        _, L, _ = x_t.shape
         pos_emb = self.pos_emb[:, :L, :]  # [1, L, n_embd]
         time_emb = self.time_emb(t)
         if time_emb.dim() == 1:  # Scalar t case, [n_embd]
@@ -106,14 +103,11 @@ class NoisePredictionTransformer(nn.Module):
         time_emb = time_emb.unsqueeze(1)  # [1, 1, n_embd]
         condition = condition.unsqueeze(1)  # [B, 1, n_embd]
 
-        # Expand to match sequence length L
-        time_emb = time_emb.expand(B, L, -1)  # [B, L, n_embd]
-
         x = x_t + pos_emb + time_emb + condition
         return self.encoder(x)
 
 
-# Symbolic Diffusion with Hybrid Loss
+# influenced by https://github.com/lucidrains/denoising-diffusion-pytorch/blob/main/denoising_diffusion_pytorch/simple_diffusion.py
 class SymbolicGaussianDiffusion(nn.Module):
     def __init__(
         self,
@@ -140,15 +134,12 @@ class SymbolicGaussianDiffusion(nn.Module):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Embedding layers
         self.tok_emb = nn.Embedding(vocab_size, n_embd, padding_idx=self.padding_idx)
         self.vars_emb = nn.Embedding(max_num_vars, n_embd)
 
-        # Decoder
         self.decoder = nn.Linear(n_embd, vocab_size, bias=False)
         self.decoder.weight = self.tok_emb.weight
 
-        # Models
         self.tnet = tNet(tnet_config)
         self.model = NoisePredictionTransformer(
             n_embd, max_seq_len, n_layer, n_head, timesteps
@@ -209,13 +200,12 @@ class SymbolicGaussianDiffusion(nn.Module):
             )
             x = self.p_sample(x, t, t_next, condition)
 
-        # Map embeddings to token indices via decoder
         logits = self.decoder(x)  # [B, L, vocab_size]
         token_indices = torch.argmax(logits, dim=-1)  # [B, L]
         return token_indices
 
     def p_losses(
-        self, x_start, points, tokens, variables, t, noise=None, mse: bool = True
+        self, x_start, points, tokens, variables, t, noise=None, mse: bool = False
     ):
         """Hybrid loss: MSE on embeddings + CE on tokens."""
         noise = torch.randn_like(x_start)
@@ -225,28 +215,25 @@ class SymbolicGaussianDiffusion(nn.Module):
 
         # MSE loss on embeddings
         if mse:
-            mse_loss = F.mse_loss(x_start_pred, x_start, reduction="mean")
+            mse_loss = F.mse_loss(x_start_pred, x_start)
         else:
             mse_loss = torch.tensor(0.0, device=self.device)
 
         # CE loss on tokens
         logits = self.decoder(x_start_pred)  # [B, L, vocab_size]
-        ce_loss = (
-            F.cross_entropy(
-                logits.view(-1, self.vocab_size),  # [B*L, vocab_size]
-                tokens.view(-1),  # [B*L]
-                ignore_index=self.padding_idx,  # Assuming padding_idx=0
-                reduction="none",
-            )
-            .view(tokens.shape)
-            .mean()
-        )  # [B]
+        ce_loss = F.cross_entropy(
+            logits.view(-1, self.vocab_size),  # [B*L, vocab_size]
+            tokens.view(-1),  # [B*L]
+            ignore_index=self.padding_idx,
+            reduction="mean",
+        )
 
-        # Combine losses
         total_loss = mse_loss + self.ce_weight * ce_loss
         return total_loss, mse_loss, ce_loss
 
-    def forward(self, points, tokens, t):
+    def forward(self, points, tokens, variables, t, mse=False):
         token_emb = self.tok_emb(tokens)
-        total_loss, mse_loss, ce_loss = self.p_losses(token_emb, tokens, points, t)
+        total_loss, mse_loss, ce_loss = self.p_losses(
+            token_emb, points, tokens, variables, t, mse=mse
+        )
         return total_loss, mse_loss, ce_loss
