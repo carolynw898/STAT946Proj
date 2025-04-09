@@ -188,11 +188,7 @@ class SymbolicGaussianDiffusion(nn.Module):
         x = torch.randn(shape, device=self.device)
         steps = torch.arange(self.timesteps - 1, -1, -1, device=self.device)
 
-        for i in tqdm(
-            range(0, self.timesteps, ddim_step),
-            desc="sampling loop",
-            total=self.timesteps,
-        ):
+        for i in range(0, self.timesteps, ddim_step):
             t = steps[i]
             t_next = (
                 steps[i + ddim_step]
