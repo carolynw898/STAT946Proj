@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from tqdm import tqdm
+import math
 from utils import get_predicted_skeleton
 
 
@@ -15,16 +15,12 @@ class PointNetConfig:
         numberofPoints,
         numberofVars,
         numberofYs,
-        method="GPT",
-        varibleEmbedding="NOT_VAR",
         **kwargs,
     ):
         self.embeddingSize = embeddingSize
         self.numberofPoints = numberofPoints  # number of points
         self.numberofVars = numberofVars  # input dimension (Xs)
         self.numberofYs = numberofYs  # output dimension (Ys)
-        self.method = method
-        self.varibleEmbedding = varibleEmbedding
 
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -81,6 +77,98 @@ class tNet(nn.Module):
         return x
 
 
+# from https://github.com/juho-lee/set_transformer/blob/master/modules.py
+class MAB(nn.Module):
+    def __init__(self, dim_Q, dim_K, dim_V, num_heads, ln=False):
+        super(MAB, self).__init__()
+        self.dim_V = dim_V
+        self.num_heads = num_heads
+        self.fc_q = nn.Linear(dim_Q, dim_V)
+        self.fc_k = nn.Linear(dim_K, dim_V)
+        self.fc_v = nn.Linear(dim_K, dim_V)
+        if ln:
+            self.ln0 = nn.LayerNorm(dim_V)
+            self.ln1 = nn.LayerNorm(dim_V)
+        self.fc_o = nn.Linear(dim_V, dim_V)
+
+    def forward(self, Q, K):
+        Q = self.fc_q(Q)
+        K, V = self.fc_k(K), self.fc_v(K)
+
+        dim_split = self.dim_V // self.num_heads
+        Q_ = torch.cat(Q.split(dim_split, 2), 0)
+        K_ = torch.cat(K.split(dim_split, 2), 0)
+        V_ = torch.cat(V.split(dim_split, 2), 0)
+
+        A = torch.softmax(Q_.bmm(K_.transpose(1, 2)) / math.sqrt(self.dim_V), 2)
+        O = torch.cat((Q_ + A.bmm(V_)).split(Q.size(0), 0), 2)
+        O = O if getattr(self, "ln0", None) is None else self.ln0(O)
+        O = O + F.relu(self.fc_o(O))
+        O = O if getattr(self, "ln1", None) is None else self.ln1(O)
+        return O
+
+
+class SAB(nn.Module):
+    def __init__(self, dim_in, dim_out, num_heads, ln=False):
+        super(SAB, self).__init__()
+        self.mab = MAB(dim_in, dim_in, dim_out, num_heads, ln=ln)
+
+    def forward(self, X):
+        return self.mab(X, X)
+
+
+class ISAB(nn.Module):
+    def __init__(self, dim_in, dim_out, num_heads, num_inds, ln=False):
+        super(ISAB, self).__init__()
+        self.I = nn.Parameter(torch.Tensor(1, num_inds, dim_out))
+        nn.init.xavier_uniform_(self.I)
+        self.mab0 = MAB(dim_out, dim_in, dim_out, num_heads, ln=ln)
+        self.mab1 = MAB(dim_in, dim_out, dim_out, num_heads, ln=ln)
+
+    def forward(self, X):
+        H = self.mab0(self.I.repeat(X.size(0), 1, 1), X)
+        return self.mab1(X, H)
+
+
+class PMA(nn.Module):
+    def __init__(self, dim, num_heads, num_seeds, ln=False):
+        super(PMA, self).__init__()
+        self.S = nn.Parameter(torch.Tensor(1, num_seeds, dim))
+        nn.init.xavier_uniform_(self.S)
+        self.mab = MAB(dim, dim, dim, num_heads, ln=ln)
+
+    def forward(self, X):
+        return self.mab(self.S.repeat(X.size(0), 1, 1), X)
+
+
+# from https://github.com/juho-lee/set_transformer/blob/master/models.py
+class SetTransformer(nn.Module):
+    def __init__(
+        self,
+        dim_input,
+        num_outputs,
+        dim_output,
+        num_inds=32,
+        dim_hidden=128,
+        num_heads=4,
+        ln=False,
+    ):
+        super(SetTransformer, self).__init__()
+        self.enc = nn.Sequential(
+            ISAB(dim_input, dim_hidden, num_heads, num_inds, ln=ln),
+            ISAB(dim_hidden, dim_hidden, num_heads, num_inds, ln=ln),
+        )
+        self.dec = nn.Sequential(
+            PMA(dim_hidden, num_heads, num_outputs, ln=ln),
+            SAB(dim_hidden, dim_hidden, num_heads, ln=ln),
+            SAB(dim_hidden, dim_hidden, num_heads, ln=ln),
+            nn.Linear(dim_hidden, dim_output),
+        )
+
+    def forward(self, X):
+        return self.dec(self.enc(X)).squeeze(1)
+
+
 class NoisePredictionTransformer(nn.Module):
     def __init__(self, n_embd, max_seq_len, n_layer=6, n_head=8, max_timesteps=1000):
         super().__init__()
@@ -112,7 +200,7 @@ class NoisePredictionTransformer(nn.Module):
 class SymbolicGaussianDiffusion(nn.Module):
     def __init__(
         self,
-        tnet_config,
+        tnet_config: PointNetConfig,
         vocab_size,
         max_seq_len,
         padding_idx: int = 0,
@@ -123,6 +211,7 @@ class SymbolicGaussianDiffusion(nn.Module):
         timesteps=1000,
         beta_start=0.0001,
         beta_end=0.02,
+        set_transformer=True,
         ce_weight=1.0,  # Weight for CE loss relative to MSE
     ):
         super().__init__()
@@ -131,6 +220,7 @@ class SymbolicGaussianDiffusion(nn.Module):
         self.padding_idx = padding_idx
         self.n_embd = n_embd
         self.timesteps = timesteps
+        self.set_transformer = set_transformer
         self.ce_weight = ce_weight
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -141,7 +231,19 @@ class SymbolicGaussianDiffusion(nn.Module):
         self.decoder = nn.Linear(n_embd, vocab_size, bias=False)
         self.decoder.weight = self.tok_emb.weight
 
-        self.tnet = tNet(tnet_config)
+        if set_transformer:
+            dim_input = tnet_config.numberofVars + tnet_config.numberofYs
+            self.tnet = SetTransformer(
+                dim_input=dim_input,
+                num_outputs=1,
+                dim_output=n_embd,
+                num_inds=tnet_config.numberofPoints,
+                dim_hidden=tnet_config.embeddingSize,
+                num_heads=4,
+            )
+        else:
+            self.tnet = tNet(tnet_config)
+
         self.model = NoisePredictionTransformer(
             n_embd, max_seq_len, n_layer, n_head, timesteps
         )
@@ -183,6 +285,9 @@ class SymbolicGaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def sample(self, points, variables, train_dataset, batch_size=16, ddim_step=0):
+        if self.set_transformer:
+            points = points.transpose(1, 2)
+
         condition = self.tnet(points) + self.vars_emb(variables)
         shape = (batch_size, self.max_seq_len, self.n_embd)
         x = torch.randn(shape, device=self.device)
@@ -223,6 +328,10 @@ class SymbolicGaussianDiffusion(nn.Module):
         """Hybrid loss: MSE on embeddings + CE on tokens."""
         noise = torch.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise)
+
+        if self.set_transformer:
+            points = points.transpose(1, 2)
+
         condition = self.tnet(points) + self.vars_emb(variables)
         x_start_pred = self.model(x_t, t.long(), condition)
 
