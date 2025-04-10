@@ -236,8 +236,8 @@ class SymbolicGaussianDiffusion(nn.Module):
             self.tnet = SetTransformer(
                 dim_input=dim_input,
                 num_outputs=1,
+                dim_output=tnet_config.embeddingSize,
                 num_inds=tnet_config.numberofPoints,
-                dim_hidden=tnet_config.embeddingSize,
                 num_heads=4,
             )
         else:
