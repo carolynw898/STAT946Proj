@@ -31,6 +31,10 @@
 									 	scipy
 									 	matplotlib
 									 	tqdm
+										jupyterlab
+      							python-lsp-server
+      							python-lsp-ruff
+      							pylsp-mypy
 									 ]))
           ];
         };

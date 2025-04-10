@@ -312,13 +312,13 @@ class SymbolicDiffusion(nn.Module):
         return y_pred, noise_pred, noise
 
     @torch.no_grad()
-    def sample(
+    def sample_progressive(
             self,
             points: torch.Tensor,
             variables: torch.Tensor,
             device: str = "cuda",
             guidance_scale: float = 0.5,  # Added parameter for guidance strength
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generates a sample by denoising from random noise with classifier-free guidance.
         
         Args:
@@ -339,6 +339,7 @@ class SymbolicDiffusion(nn.Module):
         
         xt_emb = torch.randn(B, self.max_seq_len, self.n_embd, device=device)
         t_tensor = torch.zeros(B, dtype=torch.long, device=device)  # [B]
+        prog_embs = []
         for t in range(self.timesteps - 1, -1, -1):
             t_tensor.fill_(t)  # Update in-place: [B] all set to t
             # Batch conditional and unconditional inputs
@@ -358,9 +359,121 @@ class SymbolicDiffusion(nn.Module):
                 xt_logits = self.decoder(xt_emb)
                 xt = torch.argmax(xt_logits, dim=-1)
                 xt_emb = self.tok_emb(xt)
+
+            prog_embs.append(xt_emb)
                 
+        if not self.train_decoder:
+            xt = self.xtoi(xt_emb)
+
+        return xt, prog_embs
+
+
+    @torch.no_grad()
+    def sample(
+            self,
+            points: torch.Tensor,
+            variables: torch.Tensor,
+            device: str = "cuda",
+            guidance_scale: float = 0.5,  # Added parameter for guidance strength
+    ) -> torch.Tensor:
+        result, _ = self.sample_progressive(points, variables, device, guidance_scale)
+        return result
+
+
+    @torch.no_grad()
+    def sample_ddim_progressive(
+        self,
+        points: torch.Tensor,
+        variables: torch.Tensor,
+        device: str = "cuda",
+        guidance_scale: float = 0.5,
+        num_steps: int = 50,  # Number of DDIM steps (fewer than timesteps)
+        eta: float = 0.2,     # Controls stochasticity (0 = deterministic, 1 = DDPM-like)
+    ) -> torch.Tensor:
+        """Generates a sample using DDIM with classifier-free guidance.
+
+        Args:
+            points: [B, 2, 250] - Dataset points for conditioning
+            variables: [B] - Number of variables per sample
+            device: str - Device to use (e.g., "cuda")
+            guidance_scale: float - Strength of guidance
+            num_steps: int - Number of sampling steps (subset of timesteps)
+            eta: float - Stochasticity parameter (0 for deterministic, 1 for DDPM-like)
+
+        Returns:
+            xt: [B, L] - Generated expression (token indices)
+        """
+        B = points.shape[0]
+
+        # Precompute conditions
+        condition_cond = self.tnet(points) + self.vars_emb(variables)  # [B, n_embd]
+        condition_uncond = self.vars_emb(variables)  # [B, n_embd]
+        condition_batch = torch.cat([condition_cond, condition_uncond], dim=0)  # [2B, n_embd]
+
+        # Select subset of timesteps (e.g., linearly spaced from 0 to timesteps-1)
+        step_indices = torch.linspace(0, self.timesteps - 1, steps=num_steps + 1, device=device).long()
+        tau = step_indices[1:]  # Skip t=0 for the loop, use it at the end
+
+        # Initialize noisy embeddings
+        xt_emb = torch.randn(B, self.max_seq_len, self.n_embd, device=device)
+        prog_embs = []
+
+        # DDIM sampling loop
+        for i in range(len(tau) - 1, -1, -1):  # Reverse from last tau to first
+            t = tau[i]  # Current timestep
+            t_prev = tau[i - 1] if i > 0 else torch.tensor(0, device=device)  # Previous timestep (0 at end)
+
+            # Batch conditional and unconditional inputs
+            xt_emb_batch = xt_emb.repeat(2, 1, 1)  # [2B, L, n_embd]
+            t_batch = t.repeat(B).repeat(2)  # [2B]
+
+            # Predict noise
+            noise_pred_batch = self.transformer(xt_emb_batch, t_batch, condition_batch)
+            noise_pred_cond = noise_pred_batch[:B]  # [B, L, n_embd]
+            noise_pred_uncond = noise_pred_batch[B:]  # [B, L, n_embd]
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+            # Compute predicted x_0
+            sqrt_alpha_bar_t = torch.sqrt(self.alpha_bar[t]).view(-1, 1, 1)
+            sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - self.alpha_bar[t]).view(-1, 1, 1)
+            pred_x0 = (xt_emb - sqrt_one_minus_alpha_bar_t * noise_pred) / sqrt_alpha_bar_t
+            pred_x0 = self.round(pred_x0)
+
+            # Compute direction pointing to x_t-1
+            sqrt_alpha_bar_t_prev = torch.sqrt(self.alpha_bar[t_prev]).view(-1, 1, 1)
+            sqrt_one_minus_alpha_bar_t_prev = torch.sqrt(1 - self.alpha_bar[t_prev]).view(-1, 1, 1)
+
+            # Sigma (stochasticity control)
+            sigma_t = eta * torch.sqrt((1 - self.alpha_bar[t_prev]) / (1 - self.alpha_bar[t])) * torch.sqrt(1 - self.alpha_bar[t] / self.alpha_bar[t_prev])
+
+            # Deterministic direction
+            direction = sqrt_one_minus_alpha_bar_t_prev - sigma_t * noise_pred
+
+            # Update xt_emb
+            xt_emb = sqrt_alpha_bar_t_prev * pred_x0 + direction * noise_pred
+            if eta > 0 and t > 0:  # Add noise if eta > 0 and not final step
+                xt_emb = xt_emb + sigma_t * torch.randn_like(xt_emb)
+
+            prog_embs.append(xt_emb)
+
+        # Final mapping to token indices
         xt = self.xtoi(xt_emb)
-        return xt
+        return xt, prog_embs
+
+
+    @torch.no_grad()
+    def sample_ddim(
+        self,
+        points: torch.Tensor,
+        variables: torch.Tensor,
+        device: str = "cuda",
+        guidance_scale: float = 0.5,
+        num_steps: int = 50,  # Number of DDIM steps (fewer than timesteps)
+        eta: float = 0.0,     # Controls stochasticity (0 = deterministic, 1 = DDPM-like)
+    ) -> torch.Tensor:
+        result, _ = self.sample_ddim_progressive(points, variables, device, guidance_scale, num_steps, eta)
+
+        return result
 
 
     def loss_fn(
@@ -415,6 +528,235 @@ class SymbolicDiffusion(nn.Module):
         return total_loss, *loss_components
 
 
+class VelocityPredictionTransformer(nn.Module):
+    """Predicts the velocity field for flow matching with continuous time."""
+    def __init__(self, max_seq_len: int,
+                 n_layer: int = 4,
+                 n_head: int = 4,
+                 n_embd: int = 512):
+        super().__init__()
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, n_embd))
+        self.time_emb = nn.Linear(1, n_embd)  # Continuous time input
+        self.n_embd = n_embd
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=n_embd, nhead=n_head, dim_feedforward=n_embd * 4,
+            activation="gelu", batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layer)
+
+    def sinusoidal_embedding(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Computes sinusoidal embedding for continuous t in [0, 1].
+        
+        Args:
+            t: [B] - Continuous time between 0 and 1
+            
+        Returns:
+            [B, n_embd] - Sinusoidal embedding
+        """
+        half_dim = self.n_embd // 2
+        emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)  # Frequency scaling
+        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)  # [half_dim]
+        emb = t[:, None] * emb[None, :]  # [B, half_dim]
+        return torch.cat((torch.sin(emb), torch.cos(emb)), dim=-1)  # [B, n_embd]
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, condition: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Predicts velocity from current state, continuous time, and condition.
+
+        Args:
+            x_t: [B, L, n_embd] - Current state in the flow
+            t: [B] - Continuous time between 0 and 1
+            condition: [B, n_embd] - Combined T-Net and variable embeddings
+            mask: [B, L] - Optional padding mask (True for valid positions)
+
+        Returns:
+            velocity: [B, L, n_embd] - Predicted velocity field
+        """
+        B, L, _ = x_t.shape
+        pos_emb = self.pos_emb[:, :L, :]  # [1, L, n_embd]
+        time_emb = self.sinusoidal_embedding(t).unsqueeze(1)  # [B, 1, n_embd]
+        condition = condition.unsqueeze(1)  # [B, 1, n_embd]
+
+        time_cond = torch.cat((time_emb, condition), dim=-1)  # [B, 2 * n_embd]
+        proj = nn.Linear(2 * self.n_embd, self.n_embd).to(x_t.device)  # Project to n_embd
+        time_cond_emb = proj(time_cond)
+
+        x = x_t + pos_emb + time_cond_emb 
+        velocity = self.encoder(x, src_key_padding_mask=mask)
+        return velocity
+
+
+class SymbolicFlowMatching(nn.Module):
+    def __init__(
+        self, pconfig,
+        vocab_size: int,
+        max_seq_len: int,
+        padding_idx: int = 0,
+        max_num_vars: int = 9, n_layer: int = 4, n_head: int = 4, n_embd: int = 512,
+        tok_emb_weights: torch.Tensor = None, vars_emb_weights: torch.Tensor = None,
+        train_decoder: bool = False, p_uncond: float = 0.2
+    ):
+
+        super().__init__()
+        self.n_embd = n_embd
+        self.max_seq_len = max_seq_len
+        self.vocab_size = vocab_size
+        self.padding_idx = padding_idx
+        self.p_uncond = p_uncond
+
+        # Embedding layers
+        self.tok_emb = nn.Embedding(vocab_size, n_embd, padding_idx=padding_idx)
+        self.vars_emb = nn.Embedding(max_num_vars, n_embd)
+        if tok_emb_weights is not None:
+            self.tok_emb.weight = nn.Parameter(tok_emb_weights, requires_grad=False)
+        if vars_emb_weights is not None:
+            self.vars_emb.weight = nn.Parameter(vars_emb_weights, requires_grad=False)
+
+        # Networks
+        self.tnet = tNet(pconfig)  # Assumed to be defined externally
+        self.transformer = VelocityPredictionTransformer(max_seq_len, n_layer, n_head, n_embd)
+        self.train_decoder = train_decoder
+        if train_decoder:
+            raise NotImplementedError("Training Decoder Not Supported yet")
+            self.decoder = nn.Linear(n_embd, vocab_size)
+
+    def xtoi(self, xt):
+        B, L, _ = xt.shape
+        emb_table = self.tok_emb.weight
+        xt_flat = xt.view(B * L, -1)
+        diffs = xt_flat.unsqueeze(1) - emb_table.unsqueeze(0)
+        distances = torch.norm(diffs, p=2, dim=2)
+        return torch.argmin(distances, dim=1).view(B, L)
+
+    def round(self, xt):
+        return self.tok_emb.weight[self.xtoi(xt)]
+
+    def forward(self,
+                points: torch.Tensor,
+                tokens: torch.Tensor,
+                variables: torch.Tensor,
+                t:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Training forward pass to predict velocity field.
+
+        Args:
+            points: [B, 2, 250] - Dataset points for conditioning
+            tokens: [B, L] - Ground truth expression (token indices)
+            variables: [B] - Number of variables per sample
+
+        Returns:
+            pred_emb: [B, L, n_embd] or [B, L, vocab_size] - Predicted embeddings or logits
+            velocity_pred: [B, L, n_embd] - Predicted velocity
+            target_velocity: [B, L, n_embd] - Target velocity (x_1 - x_0)
+        """
+        B = tokens.shape[0]
+        device = tokens.device
+
+        # Condition
+        tnet_output = self.tnet(points)
+        vars_emb = self.vars_emb(variables)
+        condition = tnet_output + vars_emb
+        mask = torch.rand(B, device=device) < self.p_uncond
+        condition = torch.where(mask[:, None], vars_emb, condition)
+
+        # Sample time
+        x_0 = torch.randn(B, self.max_seq_len, self.n_embd, device=device)
+        x_1 = self.tok_emb(tokens)
+        x_t = (1 - t.view(-1, 1, 1)) * x_0 + t.view(-1, 1, 1) * x_1
+
+        # Target velocity
+        target_velocity = x_1 - x_0
+
+        # Predict velocity with padding mask
+        pad_mask = (tokens == self.padding_idx)  # [B, L]
+        velocity_pred = self.transformer(x_t, t, condition, mask=pad_mask)
+
+        # Predict embeddings or logits
+        pred_emb = x_t + velocity_pred
+        if self.train_decoder:
+            pred_emb = self.decoder(pred_emb)
+
+        return pred_emb, velocity_pred, target_velocity
+
+    @torch.no_grad()
+    def sample(self, points: torch.Tensor, variables: torch.Tensor, device: str = "cuda", guidance_scale: float = 0.5, num_steps: int = 50) -> torch.Tensor:
+        """
+        Generates a sample using Euler integration with classifier-free guidance.
+
+        Args:
+            points: [B, 2, 250] - Dataset points
+            variables: [B] - Number of variables
+            guidance_scale: float - Strength of guidance
+            num_steps: int - Number of Euler steps
+
+        Returns:
+            xt: [B, L] - Generated token indices
+        """
+        B = points.shape[0]
+        condition_cond = self.tnet(points) + self.vars_emb(variables)
+        condition_uncond = self.vars_emb(variables)
+        xt = torch.randn(B, self.max_seq_len, self.n_embd, device=device)
+        dt = 1.0 / num_steps
+
+        for step in range(num_steps):
+            t = torch.full((B,), step * dt, device=device)
+            xt_batch = xt.repeat(2, 1, 1)
+            t_batch = t.repeat(2)
+            condition_batch = torch.cat([condition_cond, condition_uncond], dim=0)
+            velocity_batch = self.transformer(xt_batch, t_batch, condition_batch)  # No mask during sampling
+            v_cond, v_uncond = velocity_batch[:B], velocity_batch[B:]
+            velocity = v_uncond + guidance_scale * (v_cond - v_uncond)
+            xt = xt + velocity * dt
+
+        return self.xtoi(xt)
+
+    def loss_fn(self,
+                velocity_pred: torch.Tensor,
+                target_velocity: torch.Tensor,
+                pred_emb: torch.Tensor,
+                tokens: torch.Tensor,
+                t: torch.Tensor,
+                verbose=False):
+        """
+        Computes the loss function for end-to-end flow matching training,
+        calculating xt and token_emb from inputs.
+
+        Args:
+            velocity_pred: [B, L, n_embd] - Predicted velocity
+            target_velocity: [B, L, n_embd] - Target velocity (x_1 - x_0)
+            pred_emb: [B, L, n_embd] - Predicted embeddings (unused here)
+            tokens: [B, L] - Input token indices
+            t: [B] - Continuous time between 0 and 1
+            verbose: bool - Whether to print loss components
+
+        Returns:
+            total_loss, mse_loss, zero, zero - Tuple of loss values
+        """
+        if self.train_decoder:
+            raise NotImplementedError("Training Decoder Not Supported yet")
+
+
+        token_emb = self.tok_emb(tokens)  # Shape: [B, L, n_embd], true embeddings (x_1)
+        x_0 = torch.randn_like(token_emb)  # Noise, shape: [B, L, n_embd]
+        t = t.view(-1, 1, 1)  # [B, 1, 1] for broadcasting
+        xt = (1 - t) * x_0 + t * token_emb  # [B, L, n_embd]
+
+        mse_loss = F.mse_loss(velocity_pred, target_velocity)
+
+        remaining_time = (1 - t)  # [B, 1, 1]
+        x_1_pred = xt + remaining_time * velocity_pred  # [B, L, n_embd]
+
+        loss_x1 = F.mse_loss(x_1_pred, token_emb)
+
+        total_loss = mse_loss + 0.1 * loss_x1  # Adjust weight as needed
+
+        if verbose:
+            print(f"MSE Velocity Loss: {mse_loss.item()}, Loss_x1: {loss_x1.item()}")
+
+        return total_loss, mse_loss, loss_x1, torch.tensor(0.0, device=tokens.device)
+
+
 if __name__ == "__main__":
     # setting hyperparameters
     n_embd = 64
@@ -457,7 +799,6 @@ if __name__ == "__main__":
         timesteps=timesteps,
         beta_start=0.0001,
         beta_end=0.02,
-        train_decoder=False,
     ).to(device)
 
     tokens = torch.randint(0, vocab_size, (batch_size, blockSize), device=device)
@@ -467,6 +808,35 @@ if __name__ == "__main__":
     print(variables.shape)
 
     t = torch.randint(0, timesteps, (tokens.shape[0],), device=device)
+
+    y_pred_emb, noise_pred, noise = model(points, tokens, variables, t)
+    generated_tokens = model.sample_ddim(points, variables, device)
+
+    loss, *loss_comps = model.loss_fn(noise_pred, noise, y_pred_emb, tokens, t)
+    print("Predicted denoise: ------------- \n", y_pred_emb)
+    print("Predicted noise  : ------------- \n", noise_pred)
+    print("Actual noise     : ------------- \n", noise)
+    print("Generated tokens : ------------- \n", generated_tokens)
+
+
+    model = SymbolicFlowMatching(
+        pconfig=pconfig,
+        vocab_size=50,
+        max_seq_len=blockSize,
+        padding_idx=1,
+        max_num_vars=9,
+        n_layer=4,
+        n_head=4,
+        n_embd=n_embd,
+    ).to(device)
+
+    tokens = torch.randint(0, vocab_size, (batch_size, blockSize), device=device)
+    points = torch.randn((batch_size, 2, numPoints), device=device)
+    variables = torch.randint(0, 9, (batch_size,), device=device)
+
+    print(variables.shape)
+
+    t = torch.rand((tokens.shape[0],), device=device)
 
     y_pred_emb, noise_pred, noise = model(points, tokens, variables, t)
     generated_tokens = model.sample(points, variables, device)

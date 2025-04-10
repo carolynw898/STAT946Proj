@@ -76,7 +76,7 @@ class CharDataset(Dataset):
         numVars,
         numYs,
         numPoints,
-        target="EQ",
+        target="Skeleton",
         addVars=False,
         const_range=[-0.4, 0.4],
         xRange=[-3.0, 3.0],
