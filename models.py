@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 from utils import CharDataset, get_skeleton
+import traceback
 
 
 # from SymbolicGPT: https://github.com/mojivalipour/symbolicgpt/blob/master/models.py
@@ -262,13 +263,23 @@ class SymbolicGaussianDiffusion(nn.Module):
         x_t = sqrt_alpha_bar * x_start + sqrt_one_minus_alpha_bar * noise
         return x_t
 
-    def p_mean_variance(self, x, t, t_next, condition):
+    def p_mean_variance(self, x, t, t_next, condition, guidance_scale=1.0):
         alpha_t = self.alpha[t]
         alpha_bar_t = self.alpha_bar[t]
         alpha_bar_t_next = self.alpha_bar[t_next]
         beta_t = self.beta[t]
 
+        if guidance_scale < 1.0:
+            x = x.repeat(2, 1, 1)
+
         x_start_pred = self.model(x, t.long(), condition)
+
+        if guidance_scale < 1.0:
+            B = x.shape[0] // 2
+            x_condition = x_start_pred[:B]  # [B, L, n_embd]
+            x_uncondition = x_start_pred[B:]
+            x_start_pred = x_uncondition + guidance_scale * (x_condition - x_uncondition)
+            x = x[:B]
 
         coeff1 = torch.sqrt(alpha_bar_t_next) * beta_t / (1 - alpha_bar_t)
         coeff2 = torch.sqrt(alpha_t) * (1 - alpha_bar_t_next) / (1 - alpha_bar_t)
@@ -277,8 +288,8 @@ class SymbolicGaussianDiffusion(nn.Module):
         return mean, variance
 
     @torch.no_grad()
-    def p_sample(self, x, t, t_next, condition):
-        mean, variance = self.p_mean_variance(x, t, t_next, condition)
+    def p_sample(self, x, t, t_next, condition, guidance_scale=1.0):
+        mean, variance = self.p_mean_variance(x, t, t_next, condition, guidance_scale=guidance_scale)
         if torch.all(t_next == 0):
             return mean
         noise = torch.randn_like(x)
@@ -298,12 +309,14 @@ class SymbolicGaussianDiffusion(nn.Module):
             points = points.transpose(1, 2)
 
         B = batch_size
-
         condition = self.tnet(points) + self.vars_emb(variables)
-        uncondition = torch.zeros_like(condition)
-        condition_uncodition = torch.cat(
-            [condition, uncondition], dim=0
-        )  # [2B, 1, n_embd]
+        assert B == condition.shape[0], "Condition and generation size missmatch."
+
+        if guidance_scale < 1.0:
+            uncondition = torch.zeros_like(condition)
+            condition = torch.cat(
+                [condition, uncondition], dim=0
+            )  # [2B, 1, n_embd]
 
         shape = (B, self.max_seq_len, self.n_embd)
         x = torch.randn(shape, device=self.device)
@@ -318,12 +331,8 @@ class SymbolicGaussianDiffusion(nn.Module):
                 if i + ddim_step < self.timesteps
                 else torch.tensor(0, device=self.device)
             )
-            x = x.repeat(2, 1, 1)
-            x = self.p_sample(x, t, t_next, condition_uncodition)
 
-            x_condition = x[:B]  # [B, L, n_embd]
-            x_uncondition = x[B:]
-            x = x_uncondition + guidance_scale * (x_condition - x_uncondition)
+            x = self.p_sample(x, t, t_next, condition, guidance_scale=guidance_scale)
 
         logits = self.decoder(x)  # [B, L, vocab_size]
         token_indices = torch.argmax(logits, dim=-1)  # [B, L]
@@ -375,3 +384,99 @@ class SymbolicGaussianDiffusion(nn.Module):
         token_emb = self.tok_emb(tokens)
         ce_loss = self.p_losses(token_emb, points, tokens, variables, t)
         return ce_loss
+
+
+def create_mock_dataset():
+    # Mock dataset compatible with get_skeleton
+    class MockDataset:
+        def __init__(self):
+            self.itos = {i: str(i) for i in range(100)}  # 0 to 99
+            self.itos[0] = "_"  # Padding token
+            self.paddingToken = "_"
+            self.vocab_size = 100
+        
+        def idx_to_token(self, idx):
+            return str(idx.item())
+    
+    return MockDataset()
+
+def sanity_check_diffusion():
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+    
+    # Device configuration
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Create a sample configuration
+    config = PointNetConfig(
+        embeddingSize=512,
+        numberofPoints=100,
+        numberofVars=3,
+        numberofYs=1
+    )
+    
+    # Initialize the model
+    model = SymbolicGaussianDiffusion(
+        tnet_config=config,
+        vocab_size=100,
+        max_seq_len=50,
+        padding_idx=0,
+        max_num_vars=9,
+        n_layer=4,
+        n_head=4,
+        n_embd=512,
+        timesteps=1000,
+        beta_start=0.0001,
+        beta_end=0.02,
+        set_transformer=True,
+        ce_weight=1.0,
+        p_uncond=0.1
+    ).to(device)
+    
+    # Create sample input tensors for forward pass
+    batch_size = 64
+    points = torch.randn(batch_size, config.numberofVars + config.numberofYs, config.numberofPoints).to(device)
+    tokens = torch.randint(1, 99, (batch_size, 50)).to(device)
+    variables = torch.randint(0, 9, (batch_size,)).to(device)
+    t = torch.randint(0, 1000, (batch_size,)).to(device)
+    
+    # Test forward pass
+    model.train()
+
+    # Create mock dataset
+    try:
+        train_dataset = create_mock_dataset()
+        print("Mock dataset created successfully!")
+        print(f"Vocab size: {train_dataset.vocab_size}, Padding token: {train_dataset.paddingToken}")
+    except Exception as e:
+        print(f"Failed to create mock dataset: {str(e)}")
+        print("Traceback:")
+        traceback.print_exc()
+        return
+
+    # Test sampling with different ddim steps and guidance scales
+    ddim_steps = [20, 100, 500]
+    guidance_scales = [0.8, 0.9, 1.0]
+
+    model.eval()
+    with torch.no_grad():
+        for ddim_step in ddim_steps:
+            for guidance_scale in guidance_scales:
+                try:
+                    predicted_skeletons = model.sample(
+                        points=points,
+                        variables=variables,
+                        train_dataset=train_dataset,
+                        batch_size=batch_size,
+                        ddim_step=ddim_step,
+                        guidance_scale=guidance_scale
+                    )
+                    print(f"Sampling successful with ddim_step={ddim_step}, guidance_scale={guidance_scale}")
+                    print(f"Generated {len(predicted_skeletons)} skeletons")
+                except Exception as e:
+                    print(f"Sampling failed with ddim_step={ddim_step}, guidance_scale={guidance_scale}: {str(e)}")
+                    print("Traceback:")
+                    traceback.print_exc()
+
+if __name__ == "__main__":
+    sanity_check_diffusion()
