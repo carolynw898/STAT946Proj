@@ -313,7 +313,7 @@ class SymbolicGaussianDiffusion(nn.Module):
         assert B == condition.shape[0], "Condition and generation size missmatch."
 
         if guidance_scale < 1.0:
-            uncondition = torch.zeros_like(condition)
+            uncondition = self.vars_emb(variables)
             condition = torch.cat(
                 [condition, uncondition], dim=0
             )  # [2B, 1, n_embd]
@@ -363,7 +363,7 @@ class SymbolicGaussianDiffusion(nn.Module):
         # classifier free guidance
         mask = torch.rand(x_start.shape[0], device=self.device) < self.p_uncond
 
-        condition = torch.where(mask.unsqueeze(1), condition, 0)
+        condition = torch.where(mask.unsqueeze(1), condition, self.vars_emb(variables))
         x_start_pred = self.model(x_t, t.long(), condition)
 
         # CE loss on tokens
