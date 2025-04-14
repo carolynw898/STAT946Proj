@@ -257,7 +257,7 @@ class SymbolicGaussianDiffusion(nn.Module):
 
 
     def q_sample(self, x_start, t, noise=None):
-        t = t/self.timesteps
+        t = (t/self.timesteps).view(-1, 1, 1)
         if noise is None:
             noise = torch.randn_like(x_start)
         x_t = (1 - t) * x_start + t * noise
@@ -265,7 +265,7 @@ class SymbolicGaussianDiffusion(nn.Module):
 
     def p_sample(self, x, t, t_next, condition, guidance_scale=1.0):
         # t is not normalized in this function
-        dt = (t - t_next)/self.timesteps
+        dt = ((t - t_next)/self.timesteps).view(-1, 1, 1)
         if guidance_scale < 1.0:
             # Duplicate x for unconditioned path
             B = x.shape[0]
@@ -423,7 +423,7 @@ def sanity_check_diffusion():
     ).to(device)
     
     # Create sample input tensors for forward pass
-    batch_size = 64
+    batch_size = 256
     points = torch.randn(batch_size, config.numberofVars + config.numberofYs, config.numberofPoints).to(device)
     tokens = torch.randint(1, 99, (batch_size, 50)).to(device)
     variables = torch.randint(0, 9, (batch_size,)).to(device)
