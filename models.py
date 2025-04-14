@@ -271,16 +271,16 @@ class SymbolicGaussianDiffusion(nn.Module):
             B = x.shape[0]
             x_uncond = x.repeat(2, 1, 1)
             # Unconditioned condition (using vars_emb only)
-            x_0_batch = self.model(x_uncond, t.long(), condition)
-            x_0_cond = x_0_batch[:B]
-            x_0_uncond = x_0_batch[B:]
+            flow_batch = self.model(x_uncond, t.long(), condition)
+            flow_cond = flow_batch[:B]
+            flow_uncond = flow_batch[B:]
 
             # Apply guidance
-            x_0_pred = x_0_uncond + guidance_scale * (x_0_cond - x_0_uncond)
+            flow_pred = flow_uncond + guidance_scale * (flow_cond - flow_uncond)
         else:
-            x_0_pred = self.model(x, t.long(), condition)
+            flow_pred = self.model(x, t.long(), condition)
         # Vector field: x_t - x_0
-        x_next = x + (xT - x_0_pred) * -dt
+        x_next = x + flow_pred * -dt
         return x_next
 
 
@@ -354,7 +354,8 @@ class SymbolicGaussianDiffusion(nn.Module):
         mask = torch.rand(x_start.shape[0], device=self.device) < self.p_uncond
 
         condition = torch.where(mask.unsqueeze(1), condition, self.vars_emb(variables))
-        x_start_pred = self.model(x_t, t.long(), condition)
+        flow_pred = self.model(x_t, t.long(), condition)
+        x0_pred = noise - flow_pred
 
         # CE loss on tokens
         logits = self.decoder(x_start_pred)  # [B, L, vocab_size]
@@ -366,9 +367,11 @@ class SymbolicGaussianDiffusion(nn.Module):
             reduction="mean",
         )
 
-        ce_loss = ce_loss * self.ce_weight
+        mse_loss = F.mse(flow_pred, noise-x_start)
 
-        return ce_loss
+        total_loss = ce_loss + mse_loss
+
+        return total_loss
 
     def forward(self, points, tokens, variables, t):
         token_emb = self.tok_emb(tokens)
