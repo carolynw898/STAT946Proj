@@ -263,7 +263,7 @@ class SymbolicGaussianDiffusion(nn.Module):
         x_t = (1 - t) * x_start + t * noise
         return x_t
 
-    def p_sample(self, x, t, t_next, condition, guidance_scale=1.0):
+    def p_sample(self, x, t, t_next, condition, xT, guidance_scale=1.0):
         # t is not normalized in this function
         dt = ((t - t_next)/self.timesteps).view(-1, 1, 1)
         if guidance_scale < 1.0:
@@ -280,7 +280,7 @@ class SymbolicGaussianDiffusion(nn.Module):
         else:
             x_0_pred = self.model(x, t.long(), condition)
         # Vector field: x_t - x_0
-        x_next = x + (x - x_0_pred) * (-dt)
+        x_next = x + (xT - x_0_pred) * -dt
         return x_next
 
 
@@ -309,6 +309,7 @@ class SymbolicGaussianDiffusion(nn.Module):
 
         shape = (B, self.max_seq_len, self.n_embd)
         x = torch.randn(shape, device=self.device)
+        xT = x
 
         steps = torch.arange(self.timesteps - 1, -1, -1, device=self.device)
 
@@ -321,7 +322,7 @@ class SymbolicGaussianDiffusion(nn.Module):
                 else torch.tensor(0, device=self.device)
             )
 
-            x = self.p_sample(x, t, t_next, condition, guidance_scale=guidance_scale)
+            x = self.p_sample(x, t, t_next, condition, xT, guidance_scale=guidance_scale)
 
         logits = self.decoder(x)  # [B, L, vocab_size]
         token_indices = torch.argmax(logits, dim=-1)  # [B, L]
