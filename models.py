@@ -255,45 +255,34 @@ class SymbolicGaussianDiffusion(nn.Module):
         self.register_buffer("alpha", 1.0 - self.beta)
         self.register_buffer("alpha_bar", torch.cumprod(self.alpha, dim=0))
 
-    def q_sample(self, x_start, t, noise=None):
-        noise = torch.randn_like(x_start)
-        sqrt_alpha_bar = torch.sqrt(self.alpha_bar[t]).view(-1, 1, 1)
-        sqrt_one_minus_alpha_bar = torch.sqrt(1 - self.alpha_bar[t]).view(-1, 1, 1)
 
-        x_t = sqrt_alpha_bar * x_start + sqrt_one_minus_alpha_bar * noise
+    def q_sample(self, x_start, t, noise=None):
+        t = t/self.timesteps
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        x_t = (1 - t) * x_start + t * noise
         return x_t
 
-    def p_mean_variance(self, x, t, t_next, condition, guidance_scale=1.0):
-        alpha_t = self.alpha[t]
-        alpha_bar_t = self.alpha_bar[t]
-        alpha_bar_t_next = self.alpha_bar[t_next]
-        beta_t = self.beta[t]
-
-        if guidance_scale < 1.0:
-            x = x.repeat(2, 1, 1)
-
-        x_start_pred = self.model(x, t.long(), condition)
-
-        if guidance_scale < 1.0:
-            B = x.shape[0] // 2
-            x_condition = x_start_pred[:B]  # [B, L, n_embd]
-            x_uncondition = x_start_pred[B:]
-            x_start_pred = x_uncondition + guidance_scale * (x_condition - x_uncondition)
-            x = x[:B]
-
-        coeff1 = torch.sqrt(alpha_bar_t_next) * beta_t / (1 - alpha_bar_t)
-        coeff2 = torch.sqrt(alpha_t) * (1 - alpha_bar_t_next) / (1 - alpha_bar_t)
-        mean = coeff1 * x_start_pred + coeff2 * x
-        variance = (1 - alpha_bar_t_next) / (1 - alpha_bar_t) * beta_t
-        return mean, variance
-
-    @torch.no_grad()
     def p_sample(self, x, t, t_next, condition, guidance_scale=1.0):
-        mean, variance = self.p_mean_variance(x, t, t_next, condition, guidance_scale=guidance_scale)
-        if torch.all(t_next == 0):
-            return mean
-        noise = torch.randn_like(x)
-        return mean + torch.sqrt(variance) * noise
+        # t is not normalized in this function
+        dt = (t - t_next)/self.timesteps
+        if guidance_scale < 1.0:
+            # Duplicate x for unconditioned path
+            B = x.shape[0]
+            x_uncond = x.repeat(2, 1, 1)
+            # Unconditioned condition (using vars_emb only)
+            x_0_batch = self.model(x_uncond, t.long(), condition)
+            x_0_cond = x_0_batch[:B]
+            x_0_uncond = x_0_batch[B:]
+
+            # Apply guidance
+            x_0_pred = x_0_uncond + guidance_scale * (x_0_cond - x_0_uncond)
+        else:
+            x_0_pred = self.model(x, t.long(), condition)
+        # Vector field: x_t - x_0
+        x_next = x + (x - x_0_pred) * dt
+        return x_next
+
 
     @torch.no_grad()
     def sample(
