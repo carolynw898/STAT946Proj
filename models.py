@@ -355,7 +355,7 @@ class SymbolicGaussianDiffusion(nn.Module):
 
         condition = torch.where(mask.unsqueeze(1), condition, self.vars_emb(variables))
         flow_pred = self.model(x_t, t.long(), condition)
-        x0_pred = noise - flow_pred
+        x_start_pred = noise - flow_pred
 
         # CE loss on tokens
         logits = self.decoder(x_start_pred)  # [B, L, vocab_size]
@@ -427,7 +427,7 @@ def sanity_check_diffusion():
     ).to(device)
     
     # Create sample input tensors for forward pass
-    batch_size = 256
+
     points = torch.randn(batch_size, config.numberofVars + config.numberofYs, config.numberofPoints).to(device)
     tokens = torch.randint(1, 99, (batch_size, 50)).to(device)
     variables = torch.randint(0, 9, (batch_size,)).to(device)
