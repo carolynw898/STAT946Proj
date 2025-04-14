@@ -280,7 +280,7 @@ class SymbolicGaussianDiffusion(nn.Module):
         else:
             x_0_pred = self.model(x, t.long(), condition)
         # Vector field: x_t - x_0
-        x_next = x + (x - x_0_pred) * dt
+        x_next = x + (x - x_0_pred) * (-dt)
         return x_next
 
 
