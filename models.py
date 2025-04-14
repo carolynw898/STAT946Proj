@@ -367,7 +367,7 @@ class SymbolicGaussianDiffusion(nn.Module):
             reduction="mean",
         )
 
-        mse_loss = F.mse(flow_pred, noise-x_start)
+        mse_loss = F.mse_loss(flow_pred, noise-x_start)
 
         total_loss = ce_loss + mse_loss
 
@@ -428,6 +428,7 @@ def sanity_check_diffusion():
     
     # Create sample input tensors for forward pass
 
+    batch_size=4
     points = torch.randn(batch_size, config.numberofVars + config.numberofYs, config.numberofPoints).to(device)
     tokens = torch.randint(1, 99, (batch_size, 50)).to(device)
     variables = torch.randint(0, 9, (batch_size,)).to(device)
@@ -435,6 +436,10 @@ def sanity_check_diffusion():
     
     # Test forward pass
     model.train()
+
+    model(points,tokens,variables,t)
+    print("Train forward")
+
 
     # Create mock dataset
     try:
