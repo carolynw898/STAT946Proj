@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
-from utils import CharDataset, get_skeleton
+from utils import get_skeleton, validate_predictions, CharDataset
 
 
 # from SymbolicGPT: https://github.com/mojivalipour/symbolicgpt/blob/master/models.py
@@ -212,8 +212,7 @@ class SymbolicGaussianDiffusion(nn.Module):
         beta_start=0.0001,
         beta_end=0.02,
         set_transformer=True,
-        ce_weight=1.0,  # Weight for CE loss relative to MSE
-        p_uncond: float = 0.1,  # Probability of unconditioned sampling
+        ce_weight=1.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -223,7 +222,6 @@ class SymbolicGaussianDiffusion(nn.Module):
         self.timesteps = timesteps
         self.set_transformer = set_transformer
         self.ce_weight = ce_weight
-        self.p_uncond = p_uncond
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -285,45 +283,34 @@ class SymbolicGaussianDiffusion(nn.Module):
         return mean + torch.sqrt(variance) * noise
 
     @torch.no_grad()
-    def sample(
-        self,
-        points,
-        variables,
-        train_dataset,
-        batch_size=16,
-        ddim_step=1,
-        guidance_scale=1.0,
-    ):
+    def sample(self, points, variables, train_dataset, batch_size=16, ddim_step=1):
         if self.set_transformer:
             points = points.transpose(1, 2)
 
-        B = batch_size
-
         condition = self.tnet(points) + self.vars_emb(variables)
-        uncondition = torch.zeros_like(condition)
-        condition_uncodition = torch.cat(
-            [condition, uncondition], dim=0
-        )  # [2B, 1, n_embd]
-
-        shape = (B, self.max_seq_len, self.n_embd)
+        shape = (batch_size, self.max_seq_len, self.n_embd)
         x = torch.randn(shape, device=self.device)
-
         steps = torch.arange(self.timesteps - 1, -1, -1, device=self.device)
 
         for i in range(0, self.timesteps, ddim_step):
             t = steps[i]
-
             t_next = (
                 steps[i + ddim_step]
                 if i + ddim_step < self.timesteps
                 else torch.tensor(0, device=self.device)
             )
-            x = x.repeat(2, 1, 1)
-            x = self.p_sample(x, t, t_next, condition_uncodition)
+            x = self.p_sample(x, t, t_next, condition)
 
-            x_condition = x[:B]  # [B, L, n_embd]
-            x_uncondition = x[B:]
-            x = x_uncondition + guidance_scale * (x_condition - x_uncondition)
+            # Print prediction every 250 steps
+            # if (i + 1) % 250 == 0:
+            #    logits = self.decoder(x)  # [B, L, vocab_size]
+            #    token_indices = torch.argmax(logits, dim=-1)  # [B, L]
+            #    for j in range(batch_size):
+            #       token_indices_j = token_indices[j]  # [L]
+            #        predicted_skeleton = get_predicted_skeleton(
+            #            token_indices_j, train_dataset
+            #        )
+            #        tqdm.write(f" sample {j}: predicted_skeleton: {predicted_skeleton}")
 
         logits = self.decoder(x)  # [B, L, vocab_size]
         token_indices = torch.argmax(logits, dim=-1)  # [B, L]
@@ -334,6 +321,16 @@ class SymbolicGaussianDiffusion(nn.Module):
             predicted_skeletons.append(predicted_skeleton)
         return predicted_skeletons
 
+    def get_expr_validation_pen(self, logits, train_dataset: CharDataset):
+        B = logits.shape[0]
+        pred_tokens = torch.argmax(logits, dim=-1)  # [B, L]
+
+        pred_skeletons = [get_skeleton(pred_tokens[i], train_dataset) for i in range(B)]
+
+        penalties = validate_predictions(pred_skeletons)
+
+        return penalties
+
     def p_losses(
         self,
         x_start,
@@ -341,8 +338,8 @@ class SymbolicGaussianDiffusion(nn.Module):
         tokens,
         variables,
         t,
+        train_dataset: CharDataset,
     ):
-        """Hybrid loss: MSE on embeddings + CE on tokens."""
         noise = torch.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise)
 
@@ -351,14 +348,11 @@ class SymbolicGaussianDiffusion(nn.Module):
 
         condition = self.tnet(points) + self.vars_emb(variables)
 
-        # classifier free guidance
-        mask = torch.rand(x_start.shape[0], device=self.device) < self.p_uncond
-
-        condition = torch.where(mask.unsqueeze(1), condition, 0)
         x_start_pred = self.model(x_t, t.long(), condition)
 
-        # CE loss on tokens
         logits = self.decoder(x_start_pred)  # [B, L, vocab_size]
+
+        expr_validation_pen = self.get_expr_validation_pen(logits, train_dataset).mean()
 
         ce_loss = F.cross_entropy(
             logits.view(-1, self.vocab_size),  # [B*L, vocab_size]
@@ -369,9 +363,13 @@ class SymbolicGaussianDiffusion(nn.Module):
 
         ce_loss = ce_loss * self.ce_weight
 
-        return ce_loss
+        total_loss = ce_loss + expr_validation_pen * ce_loss
 
-    def forward(self, points, tokens, variables, t):
+        return total_loss, expr_validation_pen, ce_loss
+
+    def forward(self, points, tokens, variables, t, train_dataset: CharDataset):
         token_emb = self.tok_emb(tokens)
-        ce_loss = self.p_losses(token_emb, points, tokens, variables, t)
-        return ce_loss
+        total_loss, expr_validation_pen, ce_loss = self.p_losses(
+            token_emb, points, tokens, variables, t, train_dataset
+        )
+        return total_loss, expr_validation_pen, ce_loss
