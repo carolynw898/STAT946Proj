@@ -4,9 +4,7 @@ from torch.utils.data import Dataset
 import re
 import numpy as np
 import random
-from scipy.optimize import minimize
-import math
-import matplotlib.pyplot as plt
+from sympy import sympify, Symbol, sin, cos, log, exp
 
 
 def generateDataStrEq(
@@ -341,3 +339,40 @@ def get_skeleton(tokens, train_dataset: CharDataset):
     skeleton = skeleton.replace("Ce", "C*e")
 
     return skeleton
+
+
+def validate_predictions(
+    skeletons, variables=["x1", "x2", "x3", "x4", "x5"], constant_symbol="C"
+):
+    # Define allowed symbols
+    local_dict = {var: Symbol(var) for var in variables}
+    local_dict[constant_symbol] = Symbol(constant_symbol)
+
+    # Add allowed functions from SymPy
+    local_dict.update(
+        {
+            "sin": sin,
+            "cos": cos,
+            "log": log,
+            "exp": exp,
+        }
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    penalties = torch.full(
+        (len(skeletons),), fill_value=0, dtype=torch.float32, device=device
+    )
+    for i, skeleton in enumerate(skeletons):
+
+        if not skeleton or skeleton.isspace():
+            penalties[i] = 1.0
+            continue
+        try:
+            expr = sympify(
+                skeleton, locals=local_dict, evaluate=False, convert_xor=True
+            )
+        except Exception as e:
+            penalties[i] = 1.0
+
+    return penalties
